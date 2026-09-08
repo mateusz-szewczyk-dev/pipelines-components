@@ -28,7 +28,7 @@ def autogluon_models_training(
     preset: str = "speed",
     eval_metric: str = "",
 ) -> NamedTuple("outputs", eval_metric=str, best_model_name=str):
-    """Train AutoGluon models, select the top N, and refit each on the full dataset.
+    """Train AutoGluon models, select the top N, and refit each on the full dataset1.
 
     Expects pre-cleaned CSV data from the tabular data loader (infinite values replaced,
     duplicates removed, missing labels dropped). Reads train/test/extra-train CSVs and
