@@ -113,7 +113,7 @@ def example_pipeline(
 
 Available values for the `sampling_method` parameter are:
 
-- `"first_n_rows"`: Reads the first N rows from the file up to the component's memory limit (default 100 MB).
+- `"first_n_rows"`: Reads the first N rows from the file up to the component's preset-dependent memory limit (``"speed"``: 100 MB, ``"balanced"``: 1 GB).
 - `"stratified"`: Samples the dataset in a way that preserves the distribution of the `label_column`. Only available if `label_column` is specified and task type is classification.
 - `"random"`: Randomly samples rows from the dataset up to the size limit.
 
@@ -236,7 +236,7 @@ Match stage ids to the tabular pipeline entry in ``component_stage_map.json`` fr
 ## Supported formats and limits 📋
 
 - **Format**: CSV only.
-- **Size limit**: Up to 100 MB of data in memory (sampled if larger).
+- **Size limit**: Preset-dependent size budget in memory (sampled if larger) — ``"speed"``: 100 MB, ``"balanced"``: 1 GB.
 - **Streaming**: Data is read in batches (10k rows per chunk) to handle large files.
 
 ## Logging 📝
