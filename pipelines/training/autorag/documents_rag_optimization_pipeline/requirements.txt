@@ -108,8 +108,8 @@ cryptography==50.0.1 \
     --hash=sha256:7a115ac6dd9930b7893e530dce680d55afdfad6939da19b398fd15f850327743 \
     --hash=sha256:8ae962f84e7f36290feca5f8ba7bfc01fea9cd9a48f446bca52ef115657cca3d
     # via google-auth
-datasets==5.0.0 \
-    --hash=sha256:0fbc08ef020b03a22d91ad38b3b22091a1e18c1335f2963d357ea540bfb032e7
+datasets==5.0.1 \
+    --hash=sha256:05b604c9cecc05eb7f24ddaa88b13c65674be4e0eaa0db26a3b745b7535be415
     # via
     #   evaluate
     #   unitxt
@@ -192,8 +192,8 @@ frozenlist==1.8.0 \
     # via
     #   aiohttp
     #   aiosignal
-fsspec[http]==2026.4.0 \
-    --hash=sha256:ef0c6ca507776eab560612d5785f243e2e3f6cfe42468aacdce3609353366b5b
+fsspec[http]==2026.6.0 \
+    --hash=sha256:9a76dd86f01d5e2034c8192684e131d070de32d4d9d76843821351819e6ee2ef
     # via
     #   datasets
     #   evaluate
