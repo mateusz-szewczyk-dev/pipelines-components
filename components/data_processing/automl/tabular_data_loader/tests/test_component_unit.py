@@ -1,7 +1,9 @@
 """Tests for the tabular_data_loader component.
 
 boto3, pandas, and sklearn are mocked via sys.modules so the real packages are not required.
-Tests use the stdlib csv module for asserting on output CSV content.
+The component writes train/test splits via ``to_parquet``; the mock (see ``mocked_pandas.py``)
+serializes those calls as CSV under the hood, so tests use the stdlib csv module for asserting
+on output content without needing a real pyarrow-backed Parquet writer/reader.
 """
 
 import csv
@@ -179,7 +181,7 @@ def _read_csv_path(path):
     return header, rows
 
 
-def _make_test_artifact(tmp_path, name="test_output.csv"):
+def _make_test_artifact(tmp_path, name="test_output.parquet"):
     """Create a mock artifact with .path and .uri for sampled_test_dataset."""
     art = mock.MagicMock()
     art.path = str(tmp_path / name)
@@ -277,8 +279,8 @@ class TestAutomlDataLoaderUnitTests:
             mock_s3.get_object.assert_called_once_with(Bucket="my-bucket", Key="data/file.csv")
 
         # Verify split outputs exist
-        assert (tmp_path / "datasets" / "models_selection_train_dataset.csv").exists()
-        assert (tmp_path / "datasets" / "extra_train_dataset.csv").exists()
+        assert (tmp_path / "datasets" / "models_selection_train_dataset.parquet").exists()
+        assert (tmp_path / "datasets" / "extra_train_dataset.parquet").exists()
 
     @mock.patch.dict("os.environ", mocked_env_variables)
     def test_component_explicit_first_n_rows(self, tmp_path):
@@ -321,7 +323,7 @@ class TestAutomlDataLoaderUnitTests:
             assert hasattr(result, "sample_config")
             assert result.sample_config["n_samples"] >= MIN_VALID_RECORDS
             mock_s3.get_object.assert_called_once_with(Bucket="my-bucket", Key="data/train.csv")
-        assert (tmp_path / "datasets" / "models_selection_train_dataset.csv").exists()
+        assert (tmp_path / "datasets" / "models_selection_train_dataset.parquet").exists()
 
     @mock.patch.dict("os.environ", mocked_env_variables)
     def test_component_stratified_requires_label_column(self, tmp_path):
@@ -485,8 +487,8 @@ class TestAutomlDataLoaderUnitTests:
         price_idx = None
         for path in (
             sampled_test.path,
-            tmp_path / "datasets" / "models_selection_train_dataset.csv",
-            tmp_path / "datasets" / "extra_train_dataset.csv",
+            tmp_path / "datasets" / "models_selection_train_dataset.parquet",
+            tmp_path / "datasets" / "extra_train_dataset.parquet",
         ):
             header, rows = _read_csv_path(path)
             if price_idx is None:
@@ -711,8 +713,8 @@ class TestAutomlDataLoaderUnitTests:
 
             assert result.sample_config["n_samples"] >= MIN_VALID_RECORDS
             mock_s3.get_object.assert_called_once_with(Bucket="my-bucket", Key="data/file.csv")
-        assert (tmp_path / "datasets" / "models_selection_train_dataset.csv").exists()
-        assert (tmp_path / "datasets" / "extra_train_dataset.csv").exists()
+        assert (tmp_path / "datasets" / "models_selection_train_dataset.parquet").exists()
+        assert (tmp_path / "datasets" / "extra_train_dataset.parquet").exists()
 
     @mock.patch.dict("os.environ", mocked_env_variables)
     def test_component_random_sampling_deterministic(self, tmp_path):
@@ -735,7 +737,7 @@ class TestAutomlDataLoaderUnitTests:
             MockedDataFrame.BYTES_PER_ROW = 600_000
 
             with _mock_boto3_and_pandas(get_object_side_effect=get_object):
-                sampled_test1 = _make_test_artifact(tmp_path, "test1.csv")
+                sampled_test1 = _make_test_artifact(tmp_path, "test1.parquet")
                 result1 = automl_data_loader.python_func(
                     file_key="data/file.csv",
                     bucket_name="bucket",
@@ -744,7 +746,7 @@ class TestAutomlDataLoaderUnitTests:
                     sampled_test_dataset=sampled_test1,
                     sampling_method="random",
                 )
-                sampled_test2 = _make_test_artifact(tmp_path, "test2.csv")
+                sampled_test2 = _make_test_artifact(tmp_path, "test2.parquet")
                 result2 = automl_data_loader.python_func(
                     file_key="data/file.csv",
                     bucket_name="bucket",
@@ -781,7 +783,7 @@ class TestAutomlDataLoaderUnitTests:
             )
 
             assert result.sample_config["n_samples"] == 15000
-        assert (tmp_path / "datasets" / "models_selection_train_dataset.csv").exists()
+        assert (tmp_path / "datasets" / "models_selection_train_dataset.parquet").exists()
 
 
 class TestUserProvidedTestData:
@@ -1309,8 +1311,8 @@ class TestDataLoaderSplitLogic:
                 sampled_test_dataset=sampled_test,
             )
 
-        assert "models_selection_train_dataset.csv" in result.models_selection_train_data_path
-        assert "extra_train_dataset.csv" in result.extra_train_data_path
+        assert "models_selection_train_dataset.parquet" in result.models_selection_train_data_path
+        assert "extra_train_dataset.parquet" in result.extra_train_data_path
         assert result.models_selection_train_data_path.startswith(str(tmp_path))
         assert result.extra_train_data_path.startswith(str(tmp_path))
 
@@ -1433,7 +1435,7 @@ class TestDataLoaderSplitLogic:
                 sampled_test_dataset=sampled_test,
             )
 
-        assert sampled_test.uri == "/artifacts/test.csv"
+        assert sampled_test.uri == "/artifacts/test.parquet"
         header, rows = _read_csv_path(sampled_test.path)
         assert "target" in header
         assert len(rows) >= 1

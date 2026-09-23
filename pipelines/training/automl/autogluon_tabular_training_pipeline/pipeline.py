@@ -61,7 +61,9 @@ def autogluon_tabular_training_pipeline(
     Training datasets are stored on a PVC workspace (not S3 artifacts) so that all
     pipeline steps sharing the workspace can access them without extra downloads. Only
     the test dataset is written to an S3 artifact (for use by the leaderboard evaluation
-    component). The workspace is provisioned via ``PipelineConfig.workspace``.
+    component). All three (selection-train, extra-train, test) are written as
+    Snappy-compressed Parquet rather than CSV to keep the pipeline's own copies small.
+    The workspace is provisioned via ``PipelineConfig.workspace``.
 
     **MLflow logging:**
 
@@ -84,9 +86,9 @@ def autogluon_tabular_training_pipeline(
        *Primary split** (default 80/20): separates a *test set* (20%, written to an
          S3 artifact) from the *train portion* (80%).
          **Secondary split** (default 30/70 of the train portion): produces
-         ``models_selection_train_dataset.csv`` (30%, used for model selection) and
-         ``extra_train_dataset.csv`` (70%, passed to ``refit_full`` as extra data).
-         Both train CSVs are written to the PVC workspace under
+         ``models_selection_train_dataset.parquet`` (30%, used for model selection) and
+         ``extra_train_dataset.parquet`` (70%, passed to ``refit_full`` as extra data).
+         Both train Parquet files are written to the PVC workspace under
          ``{workspace_path}/datasets/``. For classification tasks the splits are
          stratified by the label column.
 

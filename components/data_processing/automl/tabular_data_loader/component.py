@@ -40,13 +40,15 @@ def automl_data_loader(  # noqa: D417
     loading the entire dataset into memory at once. After sampling, it performs
     a two-stage split:
 
-    1. **Primary split** (default 80/20): separates a *test set* (20%, written to
-       the ``sampled_test_dataset`` S3 artifact) from the *train portion* (80%).
+    1. **Primary split** (default 80/20): separates a *test set* (20%, written as
+       Parquet to the ``sampled_test_dataset`` artifact) from the *train portion* (80%).
 
     2. **Secondary split** (default 30/70 of the train portion): produces
-       ``models_selection_train_dataset.csv`` (30%, used for model selection) and
-       ``extra_train_dataset.csv`` (70%, passed to ``refit_full`` as extra data).
-       Both are written to the PVC workspace under ``{workspace_path}/datasets/``.
+       ``models_selection_train_dataset.parquet`` (30%, used for model selection) and
+       ``extra_train_dataset.parquet`` (70%, passed to ``refit_full`` as extra data).
+       Both are written to the PVC workspace under ``{workspace_path}/datasets/`` as
+       Snappy-compressed Parquet so the workspace never holds a full-size CSV copy of
+       either split.
 
     For **regression** tasks the split is random; for **binary** and **multiclass**
     tasks the split is **stratified** by the label column by default.
@@ -70,7 +72,7 @@ def automl_data_loader(  # noqa: D417
     Args:
         file_key: S3 object key of the CSV file.
         bucket_name: S3 bucket name containing the file.
-        workspace_path: PVC workspace directory where train CSVs will be written.
+        workspace_path: PVC workspace directory where train Parquet files will be written.
         label_column: Name of the label/target column in the dataset.
         sampled_test_dataset: Output dataset artifact for the test split.
         component_status: Output artifact containing stage-level progress tracking for this component.
@@ -92,7 +94,7 @@ def automl_data_loader(  # noqa: D417
 
     Returns:
         NamedTuple: Contains sample config, split config, a sample row, and paths to
-            selection-train and extra-train CSVs.
+            selection-train and extra-train Parquet files.
     """  # noqa: E501
     import io
     import logging
@@ -134,6 +136,20 @@ def automl_data_loader(  # noqa: D417
             )
         except Exception as e:  # noqa: BLE001 - stats logging must never break the run
             logger.debug("Could not compute dataset stats for %s: %s", name, e)
+
+    def _stringify_mixed_object_columns(df):
+        """Cast ``object``-dtype columns to pandas' nullable string dtype, in place.
+
+        ``pd.read_csv`` infers each streamed chunk's dtype independently; concatenating
+        chunks that disagree on a column (e.g. one chunk all-numeric, another with a
+        stray non-numeric value) leaves that column as ``object`` with genuinely mixed
+        Python types (e.g. both ``int`` and ``str``). ``to_csv`` stringifies everything
+        silently, but pyarrow's ``to_parquet`` raises ``ArrowInvalid`` on a mixed-type
+        object column, so normalize before every Parquet write. ``astype("string")``
+        preserves missing values as ``pd.NA`` instead of the literal string ``"nan"``.
+        """
+        for column in df.select_dtypes(include="object").columns:
+            df[column] = df[column].astype("string")
 
     VALID_PRESETS = {"speed", "balanced"}
     # Sampling budget per quality tier: "speed" stays small for fast runs,
@@ -468,6 +484,7 @@ def automl_data_loader(  # noqa: D417
             file_key,
             sampling_method,
         )
+        _stringify_mixed_object_columns(sampled_dataframe)
         _log_dataset_stats("loaded (after cleansing)", sampled_dataframe)
         status.record(
             "prepare_data",
@@ -489,8 +506,8 @@ def automl_data_loader(  # noqa: D417
         test_size = split_config.get("test_size", DEFAULT_TEST_SIZE)
         random_state = split_config.get("random_state", DEFAULT_SPLIT_RANDOM_STATE)
 
-        if not sampled_test_dataset.uri or not sampled_test_dataset.uri.endswith(".csv"):
-            sampled_test_dataset.uri = (sampled_test_dataset.uri or "sampled_test_dataset") + ".csv"
+        if not sampled_test_dataset.uri or not sampled_test_dataset.uri.endswith(".parquet"):
+            sampled_test_dataset.uri = (sampled_test_dataset.uri or "sampled_test_dataset") + ".parquet"
 
         # Common setup: workspace directory and stratification flag
         datasets_dir = Path(workspace_path) / "datasets"
@@ -570,7 +587,8 @@ def automl_data_loader(  # noqa: D417
                 )
 
             # Write user test data to the sampled_test_dataset artifact
-            user_test_df.to_csv(sampled_test_dataset.path, index=False)
+            _stringify_mixed_object_columns(user_test_df)
+            user_test_df.to_parquet(sampled_test_dataset.path, index=False, compression="snappy")
 
             # Skip primary holdout -- use all sampled training rows for the secondary split.
             selection_X = sampled_dataframe.drop(columns=[label_column], inplace=False)
@@ -593,7 +611,7 @@ def automl_data_loader(  # noqa: D417
             selection_X = X_train
             selection_y = y_train
             test_sample_df = pd.concat([X_test, y_test], axis=1)
-            test_sample_df.to_csv(sampled_test_dataset.path, index=False)
+            test_sample_df.to_parquet(sampled_test_dataset.path, index=False, compression="snappy")
             effective_test_size = test_size
 
         X_sel, X_extra, y_sel, y_extra = train_test_split(
@@ -617,7 +635,7 @@ def automl_data_loader(  # noqa: D417
         if len(X_y_sel) == 0:
             raise ValueError(
                 "Secondary split produced an empty selection-train dataset; "
-                "models_selection_train_dataset.csv would be empty and downstream training would fail. "
+                "models_selection_train_dataset.parquet would be empty and downstream training would fail. "
                 "Increase training data size and/or selection_train_size."
             )
 
@@ -629,11 +647,12 @@ def automl_data_loader(  # noqa: D417
             "stratify": stratify_effective,
         }
 
-        # Common post-split: write selection-train and extra-train CSVs to workspace
-        models_selection_train_data_path = str(datasets_dir / "models_selection_train_dataset.csv")
-        extra_train_data_path = str(datasets_dir / "extra_train_dataset.csv")
-        X_y_sel.to_csv(models_selection_train_data_path, index=False)
-        X_y_extra.to_csv(extra_train_data_path, index=False)
+        # Common post-split: write selection-train and extra-train data to workspace as
+        # Snappy-compressed Parquet (typed + compressed, materially smaller on disk than CSV).
+        models_selection_train_data_path = str(datasets_dir / "models_selection_train_dataset.parquet")
+        extra_train_data_path = str(datasets_dir / "extra_train_dataset.parquet")
+        X_y_sel.to_parquet(models_selection_train_data_path, index=False, compression="snappy")
+        X_y_extra.to_parquet(extra_train_data_path, index=False, compression="snappy")
 
         split_export_metrics = {
             "test_size": split_config_out["test_size"],
