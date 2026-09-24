@@ -46,7 +46,6 @@ def autogluon_timeseries_training_pipeline(
     top_n: int = 3,
     eval_metric: str = "mean_absolute_scaled_error",
     preset: str = "speed",
-    log_model_artifacts: bool = True,
     test_data_bucket_name: str = "",
     test_data_file_key: str = "",
 ):
@@ -77,8 +76,7 @@ def autogluon_timeseries_training_pipeline(
     step (configured on the Data Science Pipelines / KFP pipeline server, not via a pipeline
     parameter). To disable MLflow logging, run the pipeline on a server without MLflow
     configured, or have the cluster admin remove the MLflow configuration from the pipeline
-    server; the training step then skips all tracking and runs unchanged. Artifact uploads can
-    additionally be turned off per run with ``log_model_artifacts=False``.
+    server; the training step then skips all tracking and runs unchanged.
 
     Pipeline stages:
 
@@ -129,9 +127,6 @@ def autogluon_timeseries_training_pipeline(
             ``"mean_absolute_scaled_error"``.
         preset: Training quality tier. ``"speed"`` (default, 4 vCPU / 16 GiB) or
             ``"balanced"`` (may run more than 2x longer, 8 vCPU / 32 GiB).
-        log_model_artifacts: When True (default), upload each model's predictor and inference
-            notebook to its MLflow child run. Set False to skip potentially large predictor
-            uploads (metrics and tags are still logged).
         test_data_bucket_name: Optional S3-compatible bucket name for a user-provided test dataset.
             Default: empty string (use the per-series holdout split from training data).
         test_data_file_key: Optional S3 object key for a user-provided test CSV file.
@@ -229,7 +224,6 @@ def autogluon_timeseries_training_pipeline(
         extra_train_data_path=data_loader_task.outputs["extra_train_data_path"],
         preset=preset,
         eval_metric=eval_metric,
-        log_model_artifacts=log_model_artifacts,
         test_data_bucket_name=test_data_bucket_name,
         test_data_file_key=test_data_file_key,
     )

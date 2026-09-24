@@ -32,7 +32,6 @@ def autogluon_timeseries_models_training(
     preset: str = "speed",
     eval_metric: str = "mean_absolute_scaled_error",
     run_name: str = "",
-    log_model_artifacts: bool = True,
     test_data_bucket_name: str = "",
     test_data_file_key: str = "",
     train_data_secret_name: str = "",
@@ -87,8 +86,6 @@ def autogluon_timeseries_models_training(
             Legacy uppercase acronyms (e.g. ``"MASE"``) are accepted and normalized to snake_case.
         run_name: Per-execution MLflow run name recorded as a tag on child runs. Falls
             back to ``pipeline_name`` when empty.
-        log_model_artifacts: When True, upload each model's predictor and notebook to its
-            MLflow child run.
         test_data_bucket_name: Optional S3 bucket for user-provided external test data.
         test_data_file_key: Optional S3 object key for user-provided external test data.
 
@@ -477,7 +474,6 @@ def autogluon_timeseries_models_training(
                 experiment_run_logger(
                     task_type="time_series",
                     eval_metric=eval_metric,
-                    log_model_artifacts=log_model_artifacts,
                     run_name=effective_run_name,
                 )
             )

@@ -10,6 +10,7 @@ import csv
 import io
 import json
 import sys
+import types
 from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
@@ -112,10 +113,24 @@ def _mock_boto3_module(get_object_return=None, get_object_side_effect=None):
     mock_botocore_exceptions.SSLError = _MockSSLError
     mock_botocore.exceptions = mock_botocore_exceptions
 
+    mock_boto3_s3 = types.ModuleType("boto3.s3")
+    mock_boto3_transfer = types.ModuleType("boto3.s3.transfer")
+
+    class TransferConfig:
+        """Minimal transfer config accepting the production keyword arguments."""
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    mock_boto3_transfer.TransferConfig = TransferConfig
+    mock_boto3_s3.transfer = mock_boto3_transfer
+
     with mock.patch.dict(
         sys.modules,
         {
             "boto3": mock_boto3,
+            "boto3.s3": mock_boto3_s3,
+            "boto3.s3.transfer": mock_boto3_transfer,
             "botocore": mock_botocore,
             "botocore.exceptions": mock_botocore_exceptions,
         },
@@ -196,14 +211,16 @@ class TestComponentStatusArtifact:
     def test_writes_component_status_json(self, tmp_path, monkeypatch):
         """Test that component_status.json is written to the output artifact."""
         monkeypatch.delenv("MLFLOW_TRACKING_URI", raising=False)
-        csv_content = "a,b,c\n1,2,3\n4,5,6\n"
-        body_stream = _csv_body(csv_content)
+        csv_content = _pad_tabular_csv("a,b,c\n1,2,3\n4,5,6\n")
+        body_stream = _csv_body(csv_content, pad=False)
         sampled_test = _make_test_artifact(tmp_path)
         component_status = mock.MagicMock()
         component_status.path = str(tmp_path / "component_status_out")
         component_status.metadata = {}
 
-        with _mock_boto3_and_pandas(get_object_return={"Body": body_stream}):
+        with _mock_boto3_and_pandas(
+            get_object_return={"Body": body_stream, "ContentLength": len(csv_content.encode("utf-8"))}
+        ):
             automl_data_loader.python_func(
                 file_key="data/file.csv",
                 bucket_name="my-bucket",
@@ -220,6 +237,13 @@ class TestComponentStatusArtifact:
         assert payload["component_id"] == "automl_data_loader"
         stage_ids = [stage["id"] for stage in payload["stages"]]
         assert stage_ids == ["prepare_data", "split_and_export"]
+        prepare_stage = next(stage for stage in payload["stages"] if stage["id"] == "prepare_data")
+        prepare_metrics = prepare_stage["metrics"]
+        assert prepare_metrics["source_bytes"] == len(csv_content.encode("utf-8"))
+        assert prepare_metrics["batches_read"] == 1
+        assert prepare_metrics["source_rows_read"] >= prepare_metrics["rows_before_cleansing"]
+        assert prepare_metrics["sampling_compactions"] >= 1
+        assert prepare_metrics["rows_before_cleansing"] >= prepare_metrics["rows"]
         split_stage = next(stage for stage in payload["stages"] if stage["id"] == "split_and_export")
         assert split_stage["status"]["state"] == "completed"
         assert split_stage["metrics"]["test_size"] == 0.2
@@ -281,6 +305,54 @@ class TestAutomlDataLoaderUnitTests:
         # Verify split outputs exist
         assert (tmp_path / "datasets" / "models_selection_train_dataset.parquet").exists()
         assert (tmp_path / "datasets" / "extra_train_dataset.parquet").exists()
+
+    @mock.patch.dict("os.environ", mocked_env_variables)
+    def test_random_sampling_uses_multipart_local_download_for_small_source(self, tmp_path):
+        """Representative sampling uses the local multipart path only for bounded sources."""
+        csv_content = _pad_tabular_csv("feature,target\n1,0\n2,1\n")
+        payload = csv_content.encode("utf-8")
+        sampled_test = _make_test_artifact(tmp_path)
+
+        with _mock_boto3_and_pandas() as mock_s3:
+            mock_s3.head_object.return_value = {"ContentLength": len(payload)}
+            mock_s3.download_file.side_effect = lambda bucket, key, destination, Config: Path(destination).write_bytes(
+                payload
+            )
+
+            result = automl_data_loader.python_func(
+                file_key="data/train.csv",
+                bucket_name="bucket",
+                workspace_path=str(tmp_path),
+                label_column="target",
+                sampled_test_dataset=sampled_test,
+                sampling_method="random",
+            )
+
+        assert result.sample_config["n_samples"] >= MIN_VALID_RECORDS
+        mock_s3.download_file.assert_called_once()
+        mock_s3.get_object.assert_not_called()
+
+    @mock.patch.dict("os.environ", mocked_env_variables)
+    def test_random_sampling_streams_source_above_local_download_budget(self, tmp_path):
+        """Large sources avoid a full node-local copy and keep progressive streaming sampling."""
+        csv_content = "feature,target\n1,0\n2,1\n"
+        sampled_test = _make_test_artifact(tmp_path)
+
+        with _mock_boto3_and_pandas(get_object_return={"Body": _csv_body(csv_content)}) as mock_s3:
+            mock_s3.head_object.return_value = {"ContentLength": 3 * 1024 * 1024 * 1024}
+
+            result = automl_data_loader.python_func(
+                file_key="data/large.csv",
+                bucket_name="bucket",
+                workspace_path=str(tmp_path),
+                label_column="target",
+                sampled_test_dataset=sampled_test,
+                sampling_method="random",
+            )
+
+        assert result.sample_config["n_samples"] >= MIN_VALID_RECORDS
+        mock_s3.download_file.assert_not_called()
+        mock_s3.get_object.assert_called_once_with(Bucket="bucket", Key="data/large.csv")
 
     @mock.patch.dict("os.environ", mocked_env_variables)
     def test_component_explicit_first_n_rows(self, tmp_path):
@@ -784,6 +856,58 @@ class TestAutomlDataLoaderUnitTests:
 
             assert result.sample_config["n_samples"] == 15000
         assert (tmp_path / "datasets" / "models_selection_train_dataset.parquet").exists()
+
+    @mock.patch.dict("os.environ", mocked_env_variables)
+    def test_random_sampling_compacts_before_pending_data_reaches_sample_cap(self, tmp_path):
+        """Pending batches are compacted before they accumulate to the retained-sample budget."""
+        header = "feature,target\n"
+        rows = "\n".join(f"{i},{i % 10}" for i in range(20000))
+        component_status = mock.MagicMock()
+        component_status.path = str(tmp_path / "component_status")
+        component_status.metadata = {}
+        sampled_test = _make_test_artifact(tmp_path)
+        original_bytes_per_row = MockedDataFrame.BYTES_PER_ROW
+
+        try:
+            # Each 10k-row batch is ~70 MB: below the 100 MB speed-sample cap,
+            # but above the 10% pending-data threshold.
+            MockedDataFrame.BYTES_PER_ROW = 7_000
+            with _mock_boto3_and_pandas(get_object_return={"Body": _csv_body(header + rows, pad=False)}):
+                automl_data_loader.python_func(
+                    file_key="data/large.csv",
+                    bucket_name="bucket",
+                    workspace_path=str(tmp_path),
+                    label_column="target",
+                    sampled_test_dataset=sampled_test,
+                    component_status=component_status,
+                    sampling_method="random",
+                )
+        finally:
+            MockedDataFrame.BYTES_PER_ROW = original_bytes_per_row
+
+        status = json.loads((tmp_path / "component_status" / "component_status.json").read_text())
+        prepare_metrics = next(stage for stage in status["stages"] if stage["id"] == "prepare_data")["metrics"]
+        assert prepare_metrics["batches_read"] == 2
+        assert prepare_metrics["sampling_compactions"] == 2
+
+    @mock.patch.dict("os.environ", mocked_env_variables)
+    def test_memory_error_is_not_treated_as_a_recoverable_partial_read(self, tmp_path):
+        """Memory exhaustion must fail the component instead of returning a partial training sample."""
+        mocked_pandas = make_mocked_pandas_module()
+        mocked_pandas.read_csv = mock.MagicMock(side_effect=MemoryError("out of memory"))
+        sampled_test = _make_test_artifact(tmp_path)
+
+        with _mock_boto3_module(get_object_return={"Body": _csv_body("feature,target\n1,0\n", pad=False)}):
+            with mock.patch.dict(sys.modules, {"pandas": mocked_pandas}):
+                with pytest.raises(MemoryError, match="out of memory"):
+                    automl_data_loader.python_func(
+                        file_key="data/train.csv",
+                        bucket_name="bucket",
+                        workspace_path=str(tmp_path),
+                        label_column="target",
+                        sampled_test_dataset=sampled_test,
+                        sampling_method="random",
+                    )
 
 
 class TestUserProvidedTestData:

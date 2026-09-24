@@ -346,7 +346,6 @@ def _run_logger_lifecycle(
     task_type: str = "binary",
     eval_metric: str = "accuracy",
     metrics_by_model: dict | None = None,
-    log_model_artifacts: bool = False,
     notebook_path: Path | None = None,
     total_fit_time_seconds: float | None = None,
 ):
@@ -358,7 +357,6 @@ def _run_logger_lifecycle(
         with experiment_run_logger(
             task_type=task_type,
             eval_metric=eval_metric,
-            log_model_artifacts=log_model_artifacts,
         ) as run_logger:
             run_logger.log_header(
                 pipeline_name="autogluon-tabular-training-pipeline",
@@ -441,9 +439,7 @@ class TestMlflowExperimentLogger:
 
         mock_mlflow = _make_mock_mlflow(_mock_run_context("parent-run", "1"), [_mock_run_context("live-child-1", "1")])
         with mock.patch.dict(sys.modules, {"mlflow": mock_mlflow}):
-            with experiment_run_logger(
-                task_type="binary", eval_metric="accuracy", log_model_artifacts=False
-            ) as run_logger:
+            with experiment_run_logger(task_type="binary", eval_metric="accuracy") as run_logger:
                 run_logger.log_header(pipeline_name="p", kfp_run_id="run-1", top_n=1)
                 # Simulate the progress callback having created a live run during fit().
                 run_logger._live_child_runs[display_name] = "live-child-1"
@@ -472,9 +468,7 @@ class TestMlflowExperimentLogger:
         mock_client = mock.MagicMock()
         mock_mlflow.MlflowClient.return_value = mock_client
         with mock.patch.dict(sys.modules, {"mlflow": mock_mlflow}):
-            with experiment_run_logger(
-                task_type="binary", eval_metric="accuracy", log_model_artifacts=False
-            ) as run_logger:
+            with experiment_run_logger(task_type="binary", eval_metric="accuracy") as run_logger:
                 run_logger.log_header(pipeline_name="p", kfp_run_id="run-1", top_n=1)
                 # The callback registered a live run for every candidate trained during fit().
                 run_logger._live_child_runs.update(
@@ -500,9 +494,7 @@ class TestMlflowExperimentLogger:
         mock_client.delete_run.side_effect = RuntimeError("boom")
         mock_mlflow.MlflowClient.return_value = mock_client
         with mock.patch.dict(sys.modules, {"mlflow": mock_mlflow}):
-            with experiment_run_logger(
-                task_type="binary", eval_metric="accuracy", log_model_artifacts=False
-            ) as run_logger:
+            with experiment_run_logger(task_type="binary", eval_metric="accuracy") as run_logger:
                 run_logger.log_header(pipeline_name="p", kfp_run_id="run-1", top_n=1)
                 run_logger._live_child_runs["CatBoost_BAG_L1"] = "run-cat"
                 # Must not raise even though delete_run blows up.
@@ -524,7 +516,6 @@ class TestMlflowExperimentLogger:
             with experiment_run_logger(
                 task_type="binary",
                 eval_metric="accuracy",
-                log_model_artifacts=False,
                 run_name="Mlflow-test",
             ) as run_logger:
                 run_logger.log_header(pipeline_name="p", kfp_run_id="run-1", kfp_run_name="Mlflow-test", top_n=1)
@@ -560,7 +551,7 @@ class TestMlflowExperimentLogger:
         mock_mlflow = _make_mock_mlflow(_mock_run_context("new-parent", "7"), [_mock_run_context("child-1", "7")])
         with mock.patch.dict(sys.modules, {"mlflow": mock_mlflow}):
             with experiment_run_logger(
-                task_type="binary", eval_metric="accuracy", log_model_artifacts=False, run_name="Mlflow-test"
+                task_type="binary", eval_metric="accuracy", run_name="Mlflow-test"
             ) as run_logger:
                 run_logger.log_header(pipeline_name="p", kfp_run_id="run-1", top_n=1)
                 run_logger.log_model(
@@ -632,7 +623,6 @@ class TestMlflowExperimentLogger:
             tmp_path=tmp_path,
             model_names=[model_name],
             metrics_by_model={model_name: {"accuracy": 0.91}},
-            log_model_artifacts=True,
             notebook_path=sanitized_notebook,
         )
 
@@ -669,7 +659,6 @@ class TestMlflowExperimentLogger:
             tmp_path=tmp_path,
             model_names=[model_name],
             metrics_by_model={model_name: {"accuracy": 0.91}},
-            log_model_artifacts=True,
         )
 
         assert logged is True

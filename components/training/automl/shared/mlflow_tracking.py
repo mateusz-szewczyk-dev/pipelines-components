@@ -679,14 +679,12 @@ class MlflowExperimentLogger:
         *,
         task_type: str,
         eval_metric: str,
-        log_model_artifacts: bool = True,
     ) -> None:
         """Store MLflow handles and tracking config; disabled when either is missing."""
         self._mlflow = mlflow
         self._config = config
         self._task_type = task_type
         self._eval_metric = eval_metric
-        self._log_model_artifacts = log_model_artifacts
         self.enabled = mlflow is not None and config is not None
         # MLflow was injected by the platform (KFP_MLFLOW_CONFIG present). Distinct from
         # ``enabled``, which also requires the mlflow package and an open parent run -- so
@@ -906,8 +904,7 @@ class MlflowExperimentLogger:
                     tmp_dir=tmp_dir / f"{display_name}_plots",
                     plot_renderer=self._plot_renderer,
                 )
-                if self._log_model_artifacts:
-                    _log_model_and_notebook_artifacts(self._mlflow, model_dir, notebook_path=notebook_path)
+                _log_model_and_notebook_artifacts(self._mlflow, model_dir, notebook_path=notebook_path)
 
                 active_child = self._mlflow.active_run()
                 if active_child is not None and active_child.info.run_id:
@@ -1019,7 +1016,6 @@ def experiment_run_logger(
     *,
     task_type: str,
     eval_metric: str,
-    log_model_artifacts: bool = True,
     run_name: str = "",
 ) -> Iterator[MlflowExperimentLogger]:
     """Yield an :class:`MlflowExperimentLogger` bound to the parent run.
@@ -1044,7 +1040,6 @@ def experiment_run_logger(
         config,
         task_type=task_type,
         eval_metric=eval_metric,
-        log_model_artifacts=log_model_artifacts,
     )
     if not run_logger.enabled:
         if config is not None:

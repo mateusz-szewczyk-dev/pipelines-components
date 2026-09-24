@@ -42,7 +42,6 @@ def autogluon_tabular_training_pipeline(
     positive_class: str = "",
     eval_metric: str = "",
     preset: str = "speed",
-    log_model_artifacts: bool = True,
     test_data_bucket_name: str = "",
     test_data_file_key: str = "",
 ):
@@ -71,8 +70,7 @@ def autogluon_tabular_training_pipeline(
     step (configured on the Data Science Pipelines / KFP pipeline server, not via a pipeline
     parameter). To disable MLflow logging, run the pipeline on a server without MLflow
     configured, or have the cluster admin remove the MLflow configuration from the pipeline
-    server; the training step then skips all tracking and runs unchanged. Artifact uploads can
-    additionally be turned off per run with ``log_model_artifacts=False``.
+    server; the training step then skips all tracking and runs unchanged.
 
     **Pipeline Stages:**
 
@@ -139,8 +137,6 @@ def autogluon_tabular_training_pipeline(
         positive_class: Optional label value for the positive class in binary classification. Defaults to the second unique class after sorting label values.
         eval_metric: Metric used for model ranking. Empty string (default) is resolved by the component to "r2" for regression and "accuracy" for binary and multiclass classification.
         preset: Training quality tier. "speed" (45-minute selection budget, default, 4 vCPU / 16 GiB) or "balanced" (180-minute selection budget, 8 vCPU / 32 GiB).
-        log_model_artifacts: When True (default), upload model artifacts to MLflow if the
-            pipeline server provides ``KFP_MLFLOW_CONFIG``. Set False to skip artifact uploads.
         test_data_bucket_name: Optional S3-compatible bucket name for a user-provided test dataset.
             Default: empty string (use the holdout split from training data).
         test_data_file_key: Optional S3 object key for a user-provided test CSV file.
@@ -192,7 +188,9 @@ def autogluon_tabular_training_pipeline(
     )
     data_loader_task.after(component_stage_map_task)
     data_loader_task.set_caching_options(False)
-    data_loader_task.set_cpu_request("2").set_memory_request("8Gi").set_cpu_limit(MAX_CPUS).set_memory_limit(MAX_MEMORY)
+    # The loader parses and samples large CSVs; reserve CPU for pandas parsing and
+    # the bounded multipart S3 transfer fast path instead of relying on burst capacity.
+    data_loader_task.set_cpu_request("4").set_memory_request("8Gi").set_cpu_limit(MAX_CPUS).set_memory_limit(MAX_MEMORY)
 
     # Object storage credentials for data loading.
     use_secret_as_env(
@@ -232,7 +230,6 @@ def autogluon_tabular_training_pipeline(
         extra_train_data_path=data_loader_task.outputs["extra_train_data_path"],
         preset=preset,
         eval_metric=eval_metric,
-        log_model_artifacts=log_model_artifacts,
         test_data_bucket_name=test_data_bucket_name,
         test_data_file_key=test_data_file_key,
     )

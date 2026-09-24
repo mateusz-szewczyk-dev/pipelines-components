@@ -18,7 +18,7 @@ test) are written as Snappy-compressed Parquet rather than CSV to keep the pipel
 **MLflow logging:**
 
 Results are logged to MLflow only when the platform injects ``KFP_MLFLOW_CONFIG`` into the step (configured on the Data Science Pipelines / KFP pipeline server, not via a pipeline parameter). To disable MLflow logging, run the pipeline on a server without MLflow configured, or have the cluster admin
-remove the MLflow configuration from the pipeline server; the training step then skips all tracking and runs unchanged. Artifact uploads can additionally be turned off per run with ``log_model_artifacts=False``.
+remove the MLflow configuration from the pipeline server; the training step then skips all tracking and runs unchanged.
 
 **Pipeline Stages:**
 
@@ -64,7 +64,6 @@ The pipeline leverages AutoGluon's unique ensembling strategy that combines mult
 | `positive_class` | `str` | `""` | Optional label value for the positive class in binary classification. Defaults to the second unique class after sorting label values. |
 | `eval_metric` | `str` | `""` | Metric used for model ranking. Empty string (default) is resolved by the component to "r2" for regression and "accuracy" for binary and multiclass classification. |
 | `preset` | `str` | `speed` | Training quality tier. "speed" (45-minute selection budget, default, 4 vCPU / 16 GiB) or "balanced" (180-minute selection budget, 8 vCPU / 32 GiB). |
-| `log_model_artifacts` | `bool` | `True` | When True (default), upload model artifacts to MLflow if the pipeline server provides ``KFP_MLFLOW_CONFIG``. Set False to skip artifact uploads. |
 | `test_data_bucket_name` | `str` | `""` | Optional S3-compatible bucket name for a user-provided test dataset. Default: empty string (use the holdout split from training data). |
 | `test_data_file_key` | `str` | `""` | Optional S3 object key for a user-provided test CSV file. Default: empty string (use the holdout split from training data). |
 
