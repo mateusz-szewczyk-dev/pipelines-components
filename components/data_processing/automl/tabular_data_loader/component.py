@@ -103,6 +103,7 @@ def automl_data_loader(  # noqa: D417
     import boto3
     import pandas as pd
     from kfp_components.components.training.automl.shared.component_status import ComponentStatusTracker
+    from kfp_components.components.training.automl.shared.parquet_utils import stringify_mixed_object_columns
     from kfp_components.components.training.automl.shared.user_test_data import (
         raise_if_test_data_empty,
         report_test_data_truncation,
@@ -136,20 +137,6 @@ def automl_data_loader(  # noqa: D417
             )
         except Exception as e:  # noqa: BLE001 - stats logging must never break the run
             logger.debug("Could not compute dataset stats for %s: %s", name, e)
-
-    def _stringify_mixed_object_columns(df):
-        """Cast ``object``-dtype columns to pandas' nullable string dtype, in place.
-
-        ``pd.read_csv`` infers each streamed chunk's dtype independently; concatenating
-        chunks that disagree on a column (e.g. one chunk all-numeric, another with a
-        stray non-numeric value) leaves that column as ``object`` with genuinely mixed
-        Python types (e.g. both ``int`` and ``str``). ``to_csv`` stringifies everything
-        silently, but pyarrow's ``to_parquet`` raises ``ArrowInvalid`` on a mixed-type
-        object column, so normalize before every Parquet write. ``astype("string")``
-        preserves missing values as ``pd.NA`` instead of the literal string ``"nan"``.
-        """
-        for column in df.select_dtypes(include="object").columns:
-            df[column] = df[column].astype("string")
 
     VALID_PRESETS = {"speed", "balanced"}
     # Sampling budget per quality tier: "speed" stays small for fast runs,
@@ -484,7 +471,7 @@ def automl_data_loader(  # noqa: D417
             file_key,
             sampling_method,
         )
-        _stringify_mixed_object_columns(sampled_dataframe)
+        stringify_mixed_object_columns(sampled_dataframe)
         _log_dataset_stats("loaded (after cleansing)", sampled_dataframe)
         status.record(
             "prepare_data",
@@ -587,8 +574,8 @@ def automl_data_loader(  # noqa: D417
                 )
 
             # Write user test data to the sampled_test_dataset artifact
-            _stringify_mixed_object_columns(user_test_df)
-            user_test_df.to_parquet(sampled_test_dataset.path, index=False, compression="snappy")
+            stringify_mixed_object_columns(user_test_df)
+            user_test_df.to_parquet(sampled_test_dataset.path, index=False)
 
             # Skip primary holdout -- use all sampled training rows for the secondary split.
             selection_X = sampled_dataframe.drop(columns=[label_column], inplace=False)
@@ -611,7 +598,7 @@ def automl_data_loader(  # noqa: D417
             selection_X = X_train
             selection_y = y_train
             test_sample_df = pd.concat([X_test, y_test], axis=1)
-            test_sample_df.to_parquet(sampled_test_dataset.path, index=False, compression="snappy")
+            test_sample_df.to_parquet(sampled_test_dataset.path, index=False)
             effective_test_size = test_size
 
         X_sel, X_extra, y_sel, y_extra = train_test_split(
@@ -651,8 +638,8 @@ def automl_data_loader(  # noqa: D417
         # Snappy-compressed Parquet (typed + compressed, materially smaller on disk than CSV).
         models_selection_train_data_path = str(datasets_dir / "models_selection_train_dataset.parquet")
         extra_train_data_path = str(datasets_dir / "extra_train_dataset.parquet")
-        X_y_sel.to_parquet(models_selection_train_data_path, index=False, compression="snappy")
-        X_y_extra.to_parquet(extra_train_data_path, index=False, compression="snappy")
+        X_y_sel.to_parquet(models_selection_train_data_path, index=False)
+        X_y_extra.to_parquet(extra_train_data_path, index=False)
 
         split_export_metrics = {
             "test_size": split_config_out["test_size"],
