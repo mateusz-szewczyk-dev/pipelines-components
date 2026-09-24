@@ -1421,12 +1421,17 @@ class TestDataLoaderSplitLogic:
 
     @mock.patch.dict("os.environ", mocked_env_variables)
     def test_test_dataset_written_to_artifact(self, tmp_path):
-        """Test dataset is written to the sampled_test_dataset artifact path."""
+        """Test dataset is written to the sampled_test_dataset artifact path via to_parquet."""
         csv_content = "a,b,target\n1,2,X\n3,4,Y\n5,6,X\n7,8,Y\n9,10,X\n"
         body_stream = _csv_body(csv_content)
         sampled_test = _make_test_artifact(tmp_path)
 
-        with _mock_boto3_and_pandas(get_object_return={"Body": body_stream}):
+        with (
+            _mock_boto3_and_pandas(get_object_return={"Body": body_stream}),
+            mock.patch.object(
+                MockedDataFrame, "to_parquet", autospec=True, side_effect=MockedDataFrame.to_parquet
+            ) as mock_to_parquet,
+        ):
             automl_data_loader.python_func(
                 file_key="data/file.csv",
                 bucket_name="bucket",
@@ -1434,6 +1439,11 @@ class TestDataLoaderSplitLogic:
                 label_column="target",
                 sampled_test_dataset=sampled_test,
             )
+
+        # Parquet is actually written (not just a filename ending in .parquet with CSV
+        # content underneath): one call each for test, selection-train, extra-train.
+        assert mock_to_parquet.call_count == 3
+        assert sampled_test.path in [call.args[1] for call in mock_to_parquet.call_args_list]
 
         assert sampled_test.uri == "/artifacts/test.parquet"
         header, rows = _read_csv_path(sampled_test.path)
