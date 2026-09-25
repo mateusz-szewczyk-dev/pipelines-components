@@ -57,13 +57,6 @@ spec:
               "documents_rag_optimization_pipeline/requirements.txt",
             ],
             "binary": {"arch": ":all:"}
-          },
-          {
-            "type": "pip",
-            "path": "pipelines/training/autorag/documents_rag_optimization_pipeline",
-            "requirements_files": [
-              "requirements-pypi.txt"
-            ]
           }
         ]
     - name: prefetch-log-level
