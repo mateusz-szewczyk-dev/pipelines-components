@@ -55,7 +55,6 @@ spec:
             "path": "pipelines/training/autorag",
             "requirements_files": [
               "documents_rag_optimization_pipeline/requirements.txt",
-              "documents_rag_optimization_pipeline/requirements-pypi-whl.txt"
             ],
             "binary": {"arch": ":all:"}
           },
