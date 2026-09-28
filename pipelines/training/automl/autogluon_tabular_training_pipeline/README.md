@@ -81,7 +81,7 @@ The pipeline leverages AutoGluon's unique ensembling strategy that combines mult
   - pipeline
   - automl
   - autogluon-tabular-training-pipeline
-- **Last Verified**: 2026-06-10 12:00:00+00:00
+- **Last Verified**: 2026-09-28 00:00:00+00:00
 - **Owners**:
   - No Parent Owners: Yes
   - Approvers:
@@ -93,6 +93,14 @@ The pipeline leverages AutoGluon's unique ensembling strategy that combines mult
     - DorotaDR
 
 <!-- custom-content -->
+
+### Training scratch storage
+
+Both training preset branches mount a disk-backed `emptyDir` at `/tmp/autogluon-scratch`.
+The initial predictor and the refit clone stay on this task-local filesystem so
+AutoGluon's clone operation does not copy through S3 FUSE. The training component
+removes its scratch directory on success and failure. The shared workspace holds
+only the two Parquet training splits needed between loading and training.
 
 ### Progress and dashboard artifacts
 

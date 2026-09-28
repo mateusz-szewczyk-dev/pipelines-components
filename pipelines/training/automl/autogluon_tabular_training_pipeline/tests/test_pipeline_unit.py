@@ -42,6 +42,23 @@ class TestAutogluonTabularTrainingPipelineUnitTests:
         finally:
             Path(tmp_path).unlink(missing_ok=True)
 
+    def test_training_branches_mount_local_scratch(self):
+        """Both preset branches mount task-local storage for AutoGluon."""
+        import yaml
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as tmp_file:
+            tmp_path = tmp_file.name
+        try:
+            compiler.Compiler().compile(autogluon_tabular_training_pipeline, package_path=tmp_path)
+            platform = list(yaml.safe_load_all(Path(tmp_path).read_text(encoding="utf-8")))[1]
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
+
+        executors = platform["platforms"]["kubernetes"]["deploymentSpec"]["executors"]
+        expected_mount = {"volumeName": "autogluon-scratch", "mountPath": "/tmp/autogluon-scratch"}
+        for name in ("exec-autogluon-models-training", "exec-autogluon-models-training-2"):
+            assert executors[name]["emptyDirMounts"] == [expected_mount]
+
     def test_pipeline_signature(self):
         """Test that the pipeline has the expected parameters."""
         # KFP pipelines expose parameters via component_spec.inputs, not inspect.signature

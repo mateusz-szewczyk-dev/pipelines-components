@@ -1,5 +1,5 @@
 from kfp import dsl
-from kfp.kubernetes import use_secret_as_env
+from kfp.kubernetes import empty_dir_mount, use_secret_as_env
 from kfp_components.components.data_processing.automl.tabular_data_loader import automl_data_loader
 from kfp_components.components.training.automl.autogluon_models_training import autogluon_models_training
 from kfp_components.components.training.automl.component_stage_map_publisher import publish_component_stage_map
@@ -236,6 +236,7 @@ def autogluon_tabular_training_pipeline(
 
     with dsl.If(preset == "balanced"):
         training_task_bl = autogluon_models_training(**_training_kwargs)
+        empty_dir_mount(training_task_bl, volume_name="autogluon-scratch", mount_path="/tmp/autogluon-scratch")
         training_task_bl.set_caching_options(False)
         training_task_bl.set_cpu_request("8").set_memory_request("32Gi").set_cpu_limit(MAX_CPUS).set_memory_limit(
             MAX_MEMORY
@@ -243,6 +244,7 @@ def autogluon_tabular_training_pipeline(
 
     with dsl.Else():
         training_task_sp = autogluon_models_training(**_training_kwargs)
+        empty_dir_mount(training_task_sp, volume_name="autogluon-scratch", mount_path="/tmp/autogluon-scratch")
         training_task_sp.set_caching_options(False)
         training_task_sp.set_cpu_request("4").set_memory_request("16Gi").set_cpu_limit(MAX_CPUS).set_memory_limit(
             MAX_MEMORY
