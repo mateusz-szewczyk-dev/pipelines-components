@@ -1134,10 +1134,9 @@ class TestAutogluonModelsTrainingUnitTests:
         assert not scratch_path.exists()
         assert list(workspace_path.iterdir()) == []
 
-    @pytest.mark.parametrize("unsafe_root", ["symlink", "foreign-owner"])
     @mock.patch("pandas.read_parquet")
-    def test_unsafe_scratch_root_is_rejected(self, mock_read_parquet, tmp_path, unsafe_root):
-        """Training must not create a child directory under an unsafe scratch root."""
+    def test_symlink_scratch_root_is_rejected(self, mock_read_parquet, tmp_path):
+        """Training must not create a child directory under a symlinked scratch root."""
         mock_read_parquet.side_effect = [_mock_parquet_frame(), _mock_parquet_frame(), _mock_parquet_frame()]
         scratch_root = Path("/tmp/autogluon-scratch")
         real_lstat = Path.lstat
@@ -1145,9 +1144,7 @@ class TestAutogluonModelsTrainingUnitTests:
         def root_lstat(path):
             if path != scratch_root:
                 return real_lstat(path)
-            if unsafe_root == "symlink":
-                return mock.Mock(st_mode=stat.S_IFLNK, st_uid=os.getuid())
-            return mock.Mock(st_mode=stat.S_IFDIR, st_uid=os.getuid() + 1)
+            return mock.Mock(st_mode=stat.S_IFLNK)
 
         workspace_path = tmp_path / "ws"
         workspace_path.mkdir()
@@ -1163,6 +1160,37 @@ class TestAutogluonModelsTrainingUnitTests:
                 )
             )
         create_temp_dir.assert_not_called()
+
+    @mock.patch("pandas.read_parquet")
+    @mock.patch("autogluon.tabular.TabularPredictor")
+    def test_writable_foreign_owned_scratch_root_is_allowed(self, mock_predictor_class, mock_read_parquet, tmp_path):
+        """A writable Kubernetes emptyDir can have a different owner than the process."""
+        mock_read_parquet.side_effect = [_mock_parquet_frame(), _mock_parquet_frame(), _mock_parquet_frame()]
+        mock_predictor_class.return_value.fit.side_effect = RuntimeError("fit failed")
+        scratch_root = Path("/tmp/autogluon-scratch")
+        real_lstat = Path.lstat
+
+        def root_lstat(path):
+            if path == scratch_root:
+                return mock.Mock(st_mode=stat.S_IFDIR, st_uid=os.getuid() + 1)
+            return real_lstat(path)
+
+        workspace_path = tmp_path / "ws"
+        workspace_path.mkdir()
+        models_artifact = mock.MagicMock(path=str(tmp_path / "out"), metadata={})
+        with (
+            mock.patch.object(Path, "lstat", autospec=True, side_effect=root_lstat),
+            pytest.raises(RuntimeError, match="fit failed"),
+        ):
+            autogluon_models_training.python_func(
+                **_base_call_kwargs(
+                    str(workspace_path), models_artifact, mock.MagicMock(path="/tmp/test.parquet"), tmp_path
+                )
+            )
+
+        scratch_path = mock_predictor_class.call_args.kwargs["path"].parent
+        assert scratch_path.parent == scratch_root
+        assert not scratch_path.exists()
 
     @mock.patch("pandas.read_parquet")
     @mock.patch("autogluon.tabular.TabularPredictor")
