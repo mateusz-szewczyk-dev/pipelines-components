@@ -1,6 +1,8 @@
 """Unit tests for the autogluon_models_training component."""
 
 import json
+import os
+import stat
 import sys
 from contextlib import contextmanager
 from pathlib import Path
@@ -1131,6 +1133,36 @@ class TestAutogluonModelsTrainingUnitTests:
         assert scratch_path.parent == Path("/tmp/autogluon-scratch")
         assert not scratch_path.exists()
         assert list(workspace_path.iterdir()) == []
+
+    @pytest.mark.parametrize("unsafe_root", ["symlink", "foreign-owner"])
+    @mock.patch("pandas.read_parquet")
+    def test_unsafe_scratch_root_is_rejected(self, mock_read_parquet, tmp_path, unsafe_root):
+        """Training must not create a child directory under an unsafe scratch root."""
+        mock_read_parquet.side_effect = [_mock_parquet_frame(), _mock_parquet_frame(), _mock_parquet_frame()]
+        scratch_root = Path("/tmp/autogluon-scratch")
+        real_lstat = Path.lstat
+
+        def root_lstat(path):
+            if path != scratch_root:
+                return real_lstat(path)
+            if unsafe_root == "symlink":
+                return mock.Mock(st_mode=stat.S_IFLNK, st_uid=os.getuid())
+            return mock.Mock(st_mode=stat.S_IFDIR, st_uid=os.getuid() + 1)
+
+        workspace_path = tmp_path / "ws"
+        workspace_path.mkdir()
+        models_artifact = mock.MagicMock(path=str(tmp_path / "out"), metadata={})
+        with (
+            mock.patch.object(Path, "lstat", autospec=True, side_effect=root_lstat),
+            mock.patch("tempfile.mkdtemp") as create_temp_dir,
+            pytest.raises(PermissionError, match="Unsafe scratch directory"),
+        ):
+            autogluon_models_training.python_func(
+                **_base_call_kwargs(
+                    str(workspace_path), models_artifact, mock.MagicMock(path="/tmp/test.parquet"), tmp_path
+                )
+            )
+        create_temp_dir.assert_not_called()
 
     @mock.patch("pandas.read_parquet")
     @mock.patch("autogluon.tabular.TabularPredictor")

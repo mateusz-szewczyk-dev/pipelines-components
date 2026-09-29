@@ -108,7 +108,9 @@ def autogluon_models_training(
     import json
     import logging
     import math
+    import os
     import shutil
+    import stat
     import tempfile
     import time
     from concurrent.futures import ThreadPoolExecutor
@@ -245,7 +247,11 @@ def autogluon_models_training(
         # The pipeline mounts a disk-backed emptyDir here; standalone tasks use the
         # container's writable filesystem at the same path.
         scratch_root = Path("/tmp/autogluon-scratch")
-        scratch_root.mkdir(parents=True, exist_ok=True)
+        scratch_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        scratch_root_stat = scratch_root.lstat()
+        if stat.S_ISLNK(scratch_root_stat.st_mode) or scratch_root_stat.st_uid != os.getuid():
+            raise PermissionError(f"Unsafe scratch directory: {scratch_root}")
+        scratch_root.chmod(0o700)
         scratch_path = Path(tempfile.mkdtemp(prefix="training-", dir=scratch_root))
         predictor_path = scratch_path / "autogluon_predictor"
         predictor_init_kwargs: dict[str, Any] = {

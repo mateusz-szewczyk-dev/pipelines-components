@@ -55,9 +55,13 @@ class TestAutogluonTabularTrainingPipelineUnitTests:
             Path(tmp_path).unlink(missing_ok=True)
 
         executors = platform["platforms"]["kubernetes"]["deploymentSpec"]["executors"]
-        expected_mount = {"volumeName": "autogluon-scratch", "mountPath": "/tmp/autogluon-scratch"}
-        for name in ("exec-autogluon-models-training", "exec-autogluon-models-training-2"):
-            assert executors[name]["emptyDirMounts"] == [expected_mount]
+        for name, size_limit in (
+            ("exec-autogluon-models-training", "32Gi"),
+            ("exec-autogluon-models-training-2", "16Gi"),
+        ):
+            assert executors[name]["emptyDirMounts"] == [
+                {"volumeName": "autogluon-scratch", "mountPath": "/tmp/autogluon-scratch", "sizeLimit": size_limit}
+            ]
 
     def test_pipeline_signature(self):
         """Test that the pipeline has the expected parameters."""

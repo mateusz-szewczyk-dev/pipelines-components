@@ -6,6 +6,8 @@ from kfp_components.components.training.automl.component_stage_map_publisher imp
 
 MAX_CPUS = "32"
 MAX_MEMORY = "64Gi"
+BALANCED_TRAINING_RESOURCE_SIZE = "32Gi"
+SPEED_TRAINING_RESOURCE_SIZE = "16Gi"
 
 # Must match run_status_templates/pipelines/<name>.json
 PIPELINE_NAME = "autogluon-tabular-training-pipeline"
@@ -236,19 +238,29 @@ def autogluon_tabular_training_pipeline(
 
     with dsl.If(preset == "balanced"):
         training_task_bl = autogluon_models_training(**_training_kwargs)
-        empty_dir_mount(training_task_bl, volume_name="autogluon-scratch", mount_path="/tmp/autogluon-scratch")
-        training_task_bl.set_caching_options(False)
-        training_task_bl.set_cpu_request("8").set_memory_request("32Gi").set_cpu_limit(MAX_CPUS).set_memory_limit(
-            MAX_MEMORY
+        empty_dir_mount(
+            training_task_bl,
+            volume_name="autogluon-scratch",
+            mount_path="/tmp/autogluon-scratch",
+            size_limit=BALANCED_TRAINING_RESOURCE_SIZE,
         )
+        training_task_bl.set_caching_options(False)
+        training_task_bl.set_cpu_request("8").set_memory_request(BALANCED_TRAINING_RESOURCE_SIZE).set_cpu_limit(
+            MAX_CPUS
+        ).set_memory_limit(MAX_MEMORY)
 
     with dsl.Else():
         training_task_sp = autogluon_models_training(**_training_kwargs)
-        empty_dir_mount(training_task_sp, volume_name="autogluon-scratch", mount_path="/tmp/autogluon-scratch")
-        training_task_sp.set_caching_options(False)
-        training_task_sp.set_cpu_request("4").set_memory_request("16Gi").set_cpu_limit(MAX_CPUS).set_memory_limit(
-            MAX_MEMORY
+        empty_dir_mount(
+            training_task_sp,
+            volume_name="autogluon-scratch",
+            mount_path="/tmp/autogluon-scratch",
+            size_limit=SPEED_TRAINING_RESOURCE_SIZE,
         )
+        training_task_sp.set_caching_options(False)
+        training_task_sp.set_cpu_request("4").set_memory_request(SPEED_TRAINING_RESOURCE_SIZE).set_cpu_limit(
+            MAX_CPUS
+        ).set_memory_limit(MAX_MEMORY)
 
 
 if __name__ == "__main__":
