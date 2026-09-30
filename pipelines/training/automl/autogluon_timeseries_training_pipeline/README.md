@@ -79,6 +79,7 @@ to a single combined ``models_artifact``.
 ### Training scratch storage
 
 Both training preset branches mount a disk-backed `emptyDir` at `/tmp/autogluon-scratch`.
+The `speed` branch limits it to 16Gi and the `balanced` branch to 32Gi.
 The selection predictor stays on that task-local filesystem and is removed after success or
 failure. The shared workspace holds only the two Parquet training splits needed between loading
 and training. Refitted predictors are saved in the model artifact.

@@ -54,9 +54,12 @@ class TestAutogluonTimeseriesTrainingPipelineUnitTests:
             Path(tmp_path).unlink(missing_ok=True)
 
         executors = platform["platforms"]["kubernetes"]["deploymentSpec"]["executors"]
-        for name in ("exec-autogluon-timeseries-models-training", "exec-autogluon-timeseries-models-training-2"):
+        for name, size_limit in (
+            ("exec-autogluon-timeseries-models-training", "32Gi"),
+            ("exec-autogluon-timeseries-models-training-2", "16Gi"),
+        ):
             assert executors[name]["emptyDirMounts"] == [
-                {"volumeName": "autogluon-scratch", "mountPath": "/tmp/autogluon-scratch"}
+                {"volumeName": "autogluon-scratch", "mountPath": "/tmp/autogluon-scratch", "sizeLimit": size_limit}
             ]
 
     def test_pipeline_signature(self):

@@ -10,6 +10,8 @@ from kfp_components.components.training.automl.component_stage_map_publisher imp
 
 MAX_CPUS = "32"
 MAX_MEMORY = "64Gi"
+SPEED_SCRATCH_SIZE = "16Gi"
+BALANCED_SCRATCH_SIZE = "32Gi"
 
 # Must match run_status_templates/pipelines/<name>.json
 PIPELINE_NAME = "autogluon-timeseries-training-pipeline"
@@ -234,6 +236,7 @@ def autogluon_timeseries_training_pipeline(
             training_task_bl,
             volume_name="autogluon-scratch",
             mount_path="/tmp/autogluon-scratch",
+            size_limit=BALANCED_SCRATCH_SIZE,
         )
         training_task_bl.set_caching_options(False)
         training_task_bl.set_cpu_request("8").set_memory_request("32Gi").set_cpu_limit(MAX_CPUS).set_memory_limit(
@@ -246,6 +249,7 @@ def autogluon_timeseries_training_pipeline(
             training_task_sp,
             volume_name="autogluon-scratch",
             mount_path="/tmp/autogluon-scratch",
+            size_limit=SPEED_SCRATCH_SIZE,
         )
         training_task_sp.set_caching_options(False)
         training_task_sp.set_cpu_request("4").set_memory_request("16Gi").set_cpu_limit(MAX_CPUS).set_memory_limit(
