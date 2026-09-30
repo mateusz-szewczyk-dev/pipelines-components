@@ -65,7 +65,7 @@ to a single combined ``models_artifact``.
   - pipeline
   - automl
   - autogluon-timeseries-training-pipeline
-- **Last Verified**: 2026-07-08 12:00:00+00:00
+- **Last Verified**: 2026-09-30 00:00:00+00:00
 - **Owners**:
   - No Parent Owners: Yes
   - Approvers:
@@ -75,6 +75,13 @@ to a single combined ``models_artifact``.
     - DorotaDR
 
 <!-- custom-content -->
+
+### Training scratch storage
+
+Both training preset branches mount a disk-backed `emptyDir` at `/tmp/autogluon-scratch`.
+The selection predictor stays on that task-local filesystem and is removed after success or
+failure. The shared workspace holds only the two Parquet training splits needed between loading
+and training. Refitted predictors are saved in the model artifact.
 
 ### Progress and dashboard artifacts
 
