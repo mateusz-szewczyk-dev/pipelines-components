@@ -234,8 +234,6 @@ def autogluon_tabular_training_pipeline(
         test_data_file_key=test_data_file_key,
     )
 
-    # Keep scratch uncapped: clone() holds a full second predictor here, and refit_full()
-    # can grow it beyond the training step's memory request.
     with dsl.If(preset == "balanced"):
         training_task_bl = autogluon_models_training(**_training_kwargs)
         empty_dir_mount(
