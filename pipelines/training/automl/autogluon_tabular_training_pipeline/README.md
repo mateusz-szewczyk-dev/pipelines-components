@@ -97,7 +97,9 @@ The pipeline leverages AutoGluon's unique ensembling strategy that combines mult
 ### Training scratch storage
 
 Both training preset branches mount a disk-backed `emptyDir` at `/tmp/autogluon-scratch`.
-The speed branch caps this volume at 16Gi and the balanced branch at 32Gi.
+The volume has no fixed size limit because it holds the initial predictor and its
+full clone at the same time, and the clone grows during refitting. The training node
+must have enough ephemeral storage for both copies and refit growth.
 The initial predictor and the refit clone stay on this task-local filesystem so
 AutoGluon's clone operation does not copy through S3 FUSE. The training component
 removes its scratch directory on success and failure. The shared workspace holds
