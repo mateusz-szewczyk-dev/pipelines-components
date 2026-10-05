@@ -103,14 +103,20 @@ The pipeline leverages AutoGluon's unique ensembling strategy that combines mult
 
 ### Training scratch storage
 
-All training preset branches mount a disk-backed `emptyDir` at `/tmp/autogluon-scratch`.
-The `speed` branch limits it to 32Gi, `balanced` to 64Gi, and `quality` to 128Gi. The volume
-holds the initial predictor and its full clone at the same time, and the clone grows
-during refitting. The training node must have enough ephemeral storage for that work.
+All training preset branches request a generic ephemeral PVC from the cluster's default
+StorageClass and mount it at `/tmp/autogluon-scratch`. The `speed` branch requests 32Gi,
+`balanced` 64Gi, and `quality` 128Gi. The claim must be provisioned before training starts,
+so scratch capacity is accounted for rather than relying on an `emptyDir` size limit. The
+default StorageClass must support dynamic provisioning of these claims.
+The volume holds the initial predictor and its full clone at the same time; the clone grows
+during refitting. These sizes are provisional; measure peak scratch usage for each preset
+on representative datasets and adjust the requests with headroom.
 The initial predictor and the refit clone stay on this task-local filesystem so
 AutoGluon's clone operation does not copy through S3 FUSE. The training component
 removes its scratch directory on success and failure. The shared workspace holds
-only the two Parquet training splits needed between loading and training.
+only the two Parquet training splits needed between loading and training. Image writable
+layers and logs still consume node-local ephemeral storage. KFP 2.16.1 cannot set that
+resource request or limit on a task, so the cluster needs a separate reserve for this overhead.
 
 ### Progress and dashboard artifacts
 

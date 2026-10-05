@@ -41,8 +41,8 @@ class TestAutogluonTabularTrainingPipelineUnitTests:
         finally:
             Path(tmp_path).unlink(missing_ok=True)
 
-    def test_training_branches_mount_local_scratch(self):
-        """Every preset branch mounts task-local storage for AutoGluon."""
+    def test_training_branches_request_scratch_volumes(self):
+        """Every preset branch requests its own provisioned scratch capacity."""
         import yaml
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as tmp_file:
@@ -54,14 +54,21 @@ class TestAutogluonTabularTrainingPipelineUnitTests:
             Path(tmp_path).unlink(missing_ok=True)
 
         executors = platform["platforms"]["kubernetes"]["deploymentSpec"]["executors"]
-        for name, size_limit in (
+        for name, size in (
             ("exec-autogluon-models-training", "64Gi"),
             ("exec-autogluon-models-training-2", "128Gi"),
             ("exec-autogluon-models-training-3", "32Gi"),
         ):
-            assert executors[name]["emptyDirMounts"] == [
-                {"volumeName": "autogluon-scratch", "mountPath": "/tmp/autogluon-scratch", "sizeLimit": size_limit}
+            assert executors[name]["genericEphemeralVolume"] == [
+                {
+                    "volumeName": "autogluon-scratch",
+                    "mountPath": "/tmp/autogluon-scratch",
+                    "accessModes": ["ReadWriteOnce"],
+                    "size": size,
+                    "defaultStorageClass": True,
+                }
             ]
+            assert "emptyDirMounts" not in executors[name]
 
     def test_pipeline_declares_32_gib_shared_workspace(self):
         """All preset branches share the 32 GiB PVC required by quality."""

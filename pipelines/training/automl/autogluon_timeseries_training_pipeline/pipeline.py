@@ -1,7 +1,7 @@
 from typing import List
 
 from kfp import dsl
-from kfp.kubernetes import empty_dir_mount, use_secret_as_env
+from kfp.kubernetes import add_ephemeral_volume, use_secret_as_env
 from kfp_components.components.data_processing.automl.timeseries_data_loader import timeseries_data_loader
 from kfp_components.components.training.automl.autogluon_timeseries_models_training import (
     autogluon_timeseries_models_training,
@@ -241,15 +241,21 @@ def autogluon_timeseries_training_pipeline(
             test_data_file_key=test_data_file_key,
         )
 
+    def _mount_training_scratch(task, size: str):
+        # A generic ephemeral PVC requests capacity before the pod runs. An emptyDir
+        # sizeLimit would cap usage without reserving any space on the node.
+        add_ephemeral_volume(
+            task,
+            volume_name="autogluon-scratch",
+            mount_path="/tmp/autogluon-scratch",
+            access_modes=["ReadWriteOnce"],
+            size=size,
+        )
+
     with dsl.If(preset == "balanced"):
         data_loader_task_bl = _create_data_loader("balanced", "32Gi")
         training_task_bl = _create_training_task(data_loader_task_bl, "balanced")
-        empty_dir_mount(
-            training_task_bl,
-            volume_name="autogluon-scratch",
-            mount_path="/tmp/autogluon-scratch",
-            size_limit=BALANCED_SCRATCH_SIZE,
-        )
+        _mount_training_scratch(training_task_bl, BALANCED_SCRATCH_SIZE)
         training_task_bl.set_caching_options(False)
         training_task_bl.set_cpu_request("8").set_memory_request("32Gi").set_cpu_limit(MAX_CPUS).set_memory_limit(
             MAX_MEMORY
@@ -258,12 +264,7 @@ def autogluon_timeseries_training_pipeline(
     with dsl.Elif(preset == "quality"):
         data_loader_task_quality = _create_data_loader("quality", "64Gi")
         training_task_quality = _create_training_task(data_loader_task_quality, "quality")
-        empty_dir_mount(
-            training_task_quality,
-            volume_name="autogluon-scratch",
-            mount_path="/tmp/autogluon-scratch",
-            size_limit=QUALITY_SCRATCH_SIZE,
-        )
+        _mount_training_scratch(training_task_quality, QUALITY_SCRATCH_SIZE)
         training_task_quality.set_caching_options(False)
         training_task_quality.set_cpu_request("16").set_memory_request("64Gi").set_cpu_limit(MAX_CPUS).set_memory_limit(
             "128Gi"
@@ -272,12 +273,7 @@ def autogluon_timeseries_training_pipeline(
     with dsl.Else():
         data_loader_task_sp = _create_data_loader(preset, "16Gi")
         training_task_sp = _create_training_task(data_loader_task_sp, "speed")
-        empty_dir_mount(
-            training_task_sp,
-            volume_name="autogluon-scratch",
-            mount_path="/tmp/autogluon-scratch",
-            size_limit=SPEED_SCRATCH_SIZE,
-        )
+        _mount_training_scratch(training_task_sp, SPEED_SCRATCH_SIZE)
         training_task_sp.set_caching_options(False)
         training_task_sp.set_cpu_request("4").set_memory_request("16Gi").set_cpu_limit(MAX_CPUS).set_memory_limit(
             MAX_MEMORY

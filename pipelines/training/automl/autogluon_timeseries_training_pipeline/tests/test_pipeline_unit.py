@@ -40,8 +40,8 @@ class TestAutogluonTimeseriesTrainingPipelineUnitTests:
         finally:
             Path(tmp_path).unlink(missing_ok=True)
 
-    def test_training_branches_mount_local_scratch(self):
-        """Every preset branch mounts disk-backed scratch for selection training."""
+    def test_training_branches_request_scratch_volumes(self):
+        """Every preset branch requests its own provisioned scratch capacity."""
         import yaml
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as tmp_file:
@@ -53,14 +53,21 @@ class TestAutogluonTimeseriesTrainingPipelineUnitTests:
             Path(tmp_path).unlink(missing_ok=True)
 
         executors = platform["platforms"]["kubernetes"]["deploymentSpec"]["executors"]
-        for name, size_limit in (
+        for name, size in (
             ("exec-autogluon-timeseries-models-training", "32Gi"),
             ("exec-autogluon-timeseries-models-training-2", "64Gi"),
             ("exec-autogluon-timeseries-models-training-3", "16Gi"),
         ):
-            assert executors[name]["emptyDirMounts"] == [
-                {"volumeName": "autogluon-scratch", "mountPath": "/tmp/autogluon-scratch", "sizeLimit": size_limit}
+            assert executors[name]["genericEphemeralVolume"] == [
+                {
+                    "volumeName": "autogluon-scratch",
+                    "mountPath": "/tmp/autogluon-scratch",
+                    "accessModes": ["ReadWriteOnce"],
+                    "size": size,
+                    "defaultStorageClass": True,
+                }
             ]
+            assert "emptyDirMounts" not in executors[name]
 
     def test_pipeline_signature(self):
         """Test that the pipeline has the expected parameters and defaults."""

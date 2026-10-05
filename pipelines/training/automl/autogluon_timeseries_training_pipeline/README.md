@@ -84,8 +84,15 @@ to a single combined ``models_artifact``.
 
 ### Training scratch storage
 
-All training preset branches mount a disk-backed `emptyDir` at `/tmp/autogluon-scratch`.
-The `speed` branch limits it to 16Gi, `balanced` to 32Gi, and `quality` to 64Gi.
+All training preset branches request a generic ephemeral PVC from the cluster's default
+StorageClass and mount it at `/tmp/autogluon-scratch`. The `speed` branch requests 16Gi,
+`balanced` 32Gi, and `quality` 64Gi. The claim must be provisioned before training starts,
+so scratch capacity is accounted for rather than relying on an `emptyDir` size limit. The
+default StorageClass must support dynamic provisioning of these claims.
+These sizes are provisional; measure peak scratch usage for each preset on representative
+datasets and adjust the requests with headroom. Image writable layers and logs still consume
+node-local ephemeral storage. KFP 2.16.1 cannot set that resource request or limit on a task,
+so the cluster needs a separate reserve for this overhead.
 The selection predictor stays on that task-local filesystem and is removed after success or
 failure. The shared workspace holds only the two Parquet training splits needed between loading
 and training. Refitted predictors are saved in the model artifact.
