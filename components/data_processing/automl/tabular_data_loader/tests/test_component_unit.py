@@ -74,6 +74,11 @@ def _csv_body(csv_content: str, *, pad: bool = True, min_rows: int = MIN_VALID_R
     return io.BytesIO(csv_content.encode("utf-8"))
 
 
+def _classification_csv(labels: list[str]) -> str:
+    """Build rows with unique features and exact class counts."""
+    return "f1,f2,target\n" + "".join(f"{i},{i + 1},{label}\n" for i, label in enumerate(labels))
+
+
 def _count_rows_with_non_empty_trip_price(csv_path: Path) -> int:
     """Match mocked CSV parsing: empty ``Trip_Price`` cell is a blank last field."""
     with csv_path.open(newline="", encoding="utf-8") as f:
@@ -770,7 +775,7 @@ class TestAutomlDataLoaderUnitTests:
 
     @mock.patch.dict("os.environ", mocked_env_variables)
     def test_stratified_train_test_split_rejection_propagates(self, tmp_path):
-        """Classification stratify failures (e.g. too few per class) surface from train_test_split."""
+        """An unexpected sklearn rejection still propagates after the loader viability check."""
 
         def train_test_split_impl(*args, **kwargs):
             if kwargs.get("stratify") is not None:
@@ -1045,6 +1050,47 @@ class TestUserProvidedTestData:
         _, sel_rows = _read_csv_path(result.models_selection_train_data_path)
         _, ext_rows = _read_csv_path(result.extra_train_data_path)
         assert len(sel_rows) + len(ext_rows) == result.sample_config["n_samples"]
+
+    @pytest.mark.parametrize(
+        ("selection_train_size", "rare_count", "minimum"),
+        [(0.3, 3, 4), (0.2, 4, 5)],
+    )
+    @mock.patch.dict("os.environ", mocked_env_variables, clear=True)
+    def test_user_test_data_checks_only_selection_extra_viability(
+        self, tmp_path, selection_train_size, rare_count, minimum
+    ):
+        """An external test file skips holdout but still checks remaining training labels."""
+        train_csv = _classification_csv(["A"] * (101 - rare_count) + ["B"] * rare_count)
+        test_csv = _classification_csv(["A", "B"])
+        sources = iter([train_csv, test_csv])
+        split_calls = []
+
+        def get_object_side_effect(**kwargs):
+            return {"Body": _csv_body(next(sources), pad=False)}
+
+        def tracking_split(*args, **kwargs):
+            split_calls.append(kwargs)
+            return _mock_train_test_split(*args, **kwargs)
+
+        with _mock_boto3_pandas_custom_train_test_split(tracking_split, get_object_side_effect=get_object_side_effect):
+            with pytest.raises(ValueError, match="Stratified selection_extra split is not viable") as exc_info:
+                automl_data_loader.python_func(
+                    file_key="data/train.csv",
+                    bucket_name="bucket",
+                    workspace_path=str(tmp_path),
+                    label_column="target",
+                    sampled_test_dataset=_make_test_artifact(tmp_path),
+                    sampling_method="first_n_rows",
+                    task_type="binary",
+                    selection_train_size=selection_train_size,
+                    test_data_bucket_name="test-bucket",
+                    test_data_file_key="data/test.csv",
+                )
+
+        assert f"'B': {rare_count}" in str(exc_info.value)
+        assert f"selection_train_size={selection_train_size}" in str(exc_info.value)
+        assert f"minimum_per_class={minimum}" in str(exc_info.value)
+        assert split_calls == []
 
     @mock.patch.dict("os.environ", mocked_env_variables, clear=True)
     def test_no_test_data_backward_compatible(self, tmp_path):
@@ -1450,6 +1496,193 @@ class TestUserProvidedTestData:
 
 class TestDataLoaderSplitLogic:
     """Tests for the train/test split logic integrated into the data loader."""
+
+    @pytest.mark.parametrize("task_type", ["binary", "regression"])
+    @mock.patch.dict("os.environ", mocked_env_variables)
+    def test_explicit_none_test_size_preserves_sklearn_default(self, tmp_path, task_type):
+        """An explicit None keeps sklearn's former 25% holdout behavior."""
+        split_calls = []
+
+        def tracking_split(*args, **kwargs):
+            split_calls.append(kwargs)
+            return _mock_train_test_split(*args, **kwargs)
+
+        body_stream = _csv_body(_classification_csv(["A", "B"] * 50 + ["A"]), pad=False)
+        with _mock_boto3_pandas_custom_train_test_split(tracking_split, get_object_return={"Body": body_stream}):
+            result = automl_data_loader.python_func(
+                file_key="data/file.csv",
+                bucket_name="bucket",
+                workspace_path=str(tmp_path),
+                label_column="target",
+                sampled_test_dataset=_make_test_artifact(tmp_path),
+                sampling_method="first_n_rows",
+                task_type=task_type,
+                split_config={"test_size": None},
+            )
+
+        assert result.split_config["test_size"] == 0.25
+        assert len(split_calls) == 2
+        assert split_calls[0]["test_size"] == 0.25
+        assert (split_calls[0]["stratify"] is not None) == (task_type == "binary")
+
+    @pytest.mark.parametrize(
+        ("invalid_input", "expected_message"),
+        [
+            ({"split_config": {"test_size": float("nan")}}, "split_config['test_size']"),
+            ({"selection_train_size": float("nan")}, "selection_train_size"),
+        ],
+    )
+    @mock.patch.dict("os.environ", mocked_env_variables)
+    def test_nan_split_fractions_raise_value_error(self, tmp_path, invalid_input, expected_message):
+        """Non-finite split fractions fail input validation with a clear error."""
+        with _mock_boto3_and_pandas():
+            with pytest.raises(ValueError) as exc_info:
+                automl_data_loader.python_func(
+                    file_key="data/file.csv",
+                    bucket_name="bucket",
+                    workspace_path=str(tmp_path),
+                    label_column="target",
+                    sampled_test_dataset=_make_test_artifact(tmp_path),
+                    task_type="binary",
+                    **invalid_input,
+                )
+
+        assert expected_message in str(exc_info.value)
+
+    @pytest.mark.parametrize(
+        ("task_type", "labels", "failing_count", "test_size", "minimum"),
+        [
+            ("binary", ["A"] * 100 + ["B"], 1, 0.2, 5),
+            ("multiclass", ["A"] * 97 + ["B"] * 2 + ["C"] * 2, 2, 0.2, 5),
+            ("binary", ["A"] * 97 + ["B"] * 4, 4, 0.2, 5),
+            ("binary", ["A"] * 92 + ["B"] * 9, 9, 0.1, 10),
+        ],
+    )
+    @mock.patch.dict("os.environ", mocked_env_variables)
+    def test_holdout_rare_class_fails_before_split(
+        self, tmp_path, task_type, labels, failing_count, test_size, minimum
+    ):
+        """A rare class fails the holdout viability check before sklearn runs."""
+        split_calls = []
+
+        def tracking_split(*args, **kwargs):
+            split_calls.append(kwargs)
+            return _mock_train_test_split(*args, **kwargs)
+
+        body_stream = _csv_body(_classification_csv(labels), pad=False)
+        with _mock_boto3_pandas_custom_train_test_split(tracking_split, get_object_return={"Body": body_stream}):
+            with pytest.raises(ValueError, match="Stratified holdout split is not viable") as exc_info:
+                automl_data_loader.python_func(
+                    file_key="data/file.csv",
+                    bucket_name="bucket",
+                    workspace_path=str(tmp_path),
+                    label_column="target",
+                    sampled_test_dataset=_make_test_artifact(tmp_path),
+                    sampling_method="first_n_rows",
+                    task_type=task_type,
+                    split_config={"test_size": test_size},
+                )
+
+        message = str(exc_info.value)
+        assert "class_counts=" in message
+        assert f"'B': {failing_count}" in message
+        assert f"test_size={test_size}" in message
+        assert "selection_train_size=0.3" in message
+        assert f"minimum_per_class={minimum}" in message
+        assert "failing_classes=" in message
+        assert "split_config.stratify=false" in message
+        assert split_calls == []
+
+    @mock.patch.dict("os.environ", mocked_env_variables)
+    def test_selection_extra_rare_class_fails_before_second_split(self, tmp_path):
+        """The secondary check uses labels remaining after the holdout split."""
+        split_calls = []
+
+        def tracking_split(*args, **kwargs):
+            split_calls.append(kwargs)
+            return _mock_train_test_split(*args, **kwargs)
+
+        labels = ["B"] * 3 + ["A"] * 96 + ["B"] * 2
+        body_stream = _csv_body(_classification_csv(labels), pad=False)
+        with _mock_boto3_pandas_custom_train_test_split(tracking_split, get_object_return={"Body": body_stream}):
+            with pytest.raises(ValueError, match="Stratified selection_extra split is not viable") as exc_info:
+                automl_data_loader.python_func(
+                    file_key="data/file.csv",
+                    bucket_name="bucket",
+                    workspace_path=str(tmp_path),
+                    label_column="target",
+                    sampled_test_dataset=_make_test_artifact(tmp_path),
+                    sampling_method="first_n_rows",
+                    task_type="binary",
+                )
+
+        message = str(exc_info.value)
+        assert "minimum_per_class=4" in message
+        assert "test_size=0.7" in message or "test_size=0.69999999999999996" in message
+        assert "'B': 3" in message
+        assert len(split_calls) == 1
+        assert split_calls[0]["stratify"] is not None
+
+    @pytest.mark.parametrize(
+        "labels",
+        [["A", "B"] * 50 + ["A"], ["A", "B", "C"] * 34],
+    )
+    @mock.patch.dict("os.environ", mocked_env_variables)
+    def test_viable_classification_keeps_both_stratified_splits(self, tmp_path, labels):
+        """Viable class counts preserve stratification at both split calls."""
+        split_calls = []
+
+        def tracking_split(*args, **kwargs):
+            split_calls.append(kwargs)
+            return _mock_train_test_split(*args, **kwargs)
+
+        body_stream = _csv_body(_classification_csv(labels), pad=False)
+        with _mock_boto3_pandas_custom_train_test_split(tracking_split, get_object_return={"Body": body_stream}):
+            result = automl_data_loader.python_func(
+                file_key="data/file.csv",
+                bucket_name="bucket",
+                workspace_path=str(tmp_path),
+                label_column="target",
+                sampled_test_dataset=_make_test_artifact(tmp_path),
+                sampling_method="first_n_rows",
+                task_type="binary" if len(set(labels)) == 2 else "multiclass",
+            )
+
+        assert result.split_config["stratify"] is True
+        assert len(split_calls) == 2
+        assert all(call["stratify"] is not None for call in split_calls)
+        assert Path(result.models_selection_train_data_path).exists()
+        assert Path(result.extra_train_data_path).exists()
+
+    @pytest.mark.parametrize(
+        ("task_type", "split_config"),
+        [("regression", None), ("binary", {"stratify": False})],
+    )
+    @mock.patch.dict("os.environ", mocked_env_variables)
+    def test_unstratified_splits_skip_rare_class_check(self, tmp_path, task_type, split_config):
+        """Regression and an explicit stratify override retain random split behavior."""
+        split_calls = []
+
+        def tracking_split(*args, **kwargs):
+            split_calls.append(kwargs)
+            return _mock_train_test_split(*args, **kwargs)
+
+        body_stream = _csv_body(_classification_csv(["A"] * 100 + ["B"]), pad=False)
+        with _mock_boto3_pandas_custom_train_test_split(tracking_split, get_object_return={"Body": body_stream}):
+            result = automl_data_loader.python_func(
+                file_key="data/file.csv",
+                bucket_name="bucket",
+                workspace_path=str(tmp_path),
+                label_column="target",
+                sampled_test_dataset=_make_test_artifact(tmp_path),
+                sampling_method="first_n_rows",
+                task_type=task_type,
+                split_config=split_config,
+            )
+
+        assert result.split_config["stratify"] is False
+        assert len(split_calls) == 2
+        assert all(call["stratify"] is None for call in split_calls)
 
     @mock.patch.dict("os.environ", mocked_env_variables)
     def test_split_outputs_have_correct_paths(self, tmp_path):

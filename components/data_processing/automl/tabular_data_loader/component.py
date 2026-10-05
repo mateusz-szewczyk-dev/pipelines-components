@@ -196,7 +196,9 @@ def automl_data_loader(  # noqa: D417
         raise ValueError("split_config must be a dictionary with possible keys test_size, random_state, stratify.")
     if isinstance(split_config, dict):
         test_size = split_config.get("test_size")
-        if test_size is not None and (not isinstance(test_size, (int, float)) or test_size <= 0 or test_size >= 1):
+        if test_size is not None and (
+            not isinstance(test_size, (int, float)) or test_size <= 0 or test_size >= 1 or not math.isfinite(test_size)
+        ):
             raise ValueError("split_config['test_size'] must be a number in (0, 1) when provided.")
         random_state = split_config.get("random_state")
         if random_state is not None and (not isinstance(random_state, int)):
@@ -206,7 +208,7 @@ def automl_data_loader(  # noqa: D417
             raise ValueError("split_config['stratify'] must be a boolean when provided.")
     if not isinstance(selection_train_size, (int, float)):
         raise ValueError("selection_train_size must be a numerical value.")
-    elif selection_train_size <= 0 or selection_train_size >= 1:
+    elif selection_train_size <= 0 or selection_train_size >= 1 or not math.isfinite(selection_train_size):
         raise ValueError("selection_train_size must be in a range 0 to 1.")
 
     test_data_bucket_name, test_data_file_key = validate_test_data_params(test_data_bucket_name, test_data_file_key)
@@ -722,6 +724,7 @@ def automl_data_loader(  # noqa: D417
         split_export_started = time.monotonic()
 
         # --- Train/test split ---
+        from decimal import Decimal
         from pathlib import Path
 
         from sklearn.model_selection import train_test_split
@@ -731,6 +734,9 @@ def automl_data_loader(  # noqa: D417
 
         split_config = split_config or {}
         test_size = split_config.get("test_size", DEFAULT_TEST_SIZE)
+        if test_size is None:
+            # sklearn used 0.25 when an explicit None reached train_test_split.
+            test_size = 0.25
         random_state = split_config.get("random_state", DEFAULT_SPLIT_RANDOM_STATE)
 
         if not sampled_test_dataset.uri or not sampled_test_dataset.uri.endswith(".parquet"):
@@ -740,6 +746,35 @@ def automl_data_loader(  # noqa: D417
         datasets_dir = Path(workspace_path) / "datasets"
         datasets_dir.mkdir(parents=True, exist_ok=True)
         stratify_effective = task_type != "regression" and split_config.get("stratify", True)
+
+        def _assert_stratified_split_viable(y, *, test_size, stage):
+            """Require every class to fit on both sides of a stratified split."""
+            if not stratify_effective:
+                return
+
+            class_counts = {label: int(count) for label, count in y.value_counts(dropna=False).items()}
+            split_fraction = Decimal(str(test_size))
+            min_per_class = max(2, math.ceil(1 / min(split_fraction, 1 - split_fraction)))
+            failing_classes = {label: count for label, count in class_counts.items() if count < min_per_class}
+            logger.info(
+                "Stratified split viability [%s]: class_counts=%s, test_size=%s, "
+                "selection_train_size=%s, minimum_per_class=%s, viable=%s",
+                stage,
+                class_counts,
+                test_size,
+                selection_train_size,
+                min_per_class,
+                not failing_classes,
+            )
+            if failing_classes:
+                raise ValueError(
+                    f"Stratified {stage} split is not viable: class_counts={class_counts}, "
+                    f"test_size={test_size}, selection_train_size={selection_train_size}, "
+                    f"minimum_per_class={min_per_class} (at least 2 for sklearn and "
+                    "enough for each class on both sides), "
+                    f"failing_classes={failing_classes}. Add data or increase rare-class counts, "
+                    "or set split_config.stratify=false explicitly."
+                )
 
         has_user_test_data = bool(test_data_file_key)
 
@@ -828,6 +863,7 @@ def automl_data_loader(  # noqa: D417
             X = sampled_dataframe.drop(columns=[label_column], inplace=False)
             y = sampled_dataframe[label_column]
 
+            _assert_stratified_split_viable(y, test_size=test_size, stage="holdout")
             X_train, X_test, y_train, y_test = train_test_split(
                 X,
                 y,
@@ -845,6 +881,7 @@ def automl_data_loader(  # noqa: D417
         eligible_train_rows = len(selection_X)
         eligible_train_bytes = _memory_usage_bytes(selection_X) + _memory_usage_bytes(selection_y)
 
+        _assert_stratified_split_viable(selection_y, test_size=(1 - selection_train_size), stage="selection_extra")
         X_sel, X_extra, y_sel, y_extra = train_test_split(
             selection_X,
             selection_y,
