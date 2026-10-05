@@ -757,28 +757,31 @@ def automl_data_loader(  # noqa: D417
             test_rows = math.ceil(len(y) * test_size)
             train_rows = len(y) - test_rows
             min_per_class = 2
-            failing_classes = {label: count for label, count in class_counts.items() if count < min_per_class}
+            class_sizes = sorted(class_counts.values(), reverse=True)
+            failing_class_counts = sorted(count for count in class_sizes if count < min_per_class)
+            viable = not failing_class_counts and train_rows >= n_classes and test_rows >= n_classes
             logger.info(
                 "Stratified split viability [%s]: class_counts=%s, test_size=%s, "
                 "selection_train_size=%s, minimum_per_class=%s, n_classes=%s, "
                 "train_rows=%s, test_rows=%s, viable=%s",
                 stage,
-                class_counts,
+                class_sizes,
                 test_size,
                 selection_train_size,
                 min_per_class,
                 n_classes,
                 train_rows,
                 test_rows,
-                not failing_classes and train_rows >= n_classes and test_rows >= n_classes,
+                viable,
             )
-            if failing_classes or train_rows < n_classes or test_rows < n_classes:
+            if not viable:
                 raise ValueError(
-                    f"Stratified {stage} split is not viable: class_counts={class_counts}, "
+                    f"Stratified {stage} split is not viable: class_counts={class_sizes}, "
                     f"test_size={test_size}, selection_train_size={selection_train_size}, "
                     f"minimum_per_class={min_per_class}, n_classes={n_classes}, "
                     f"train_rows={train_rows}, test_rows={test_rows}, "
-                    f"failing_classes={failing_classes}. Add data or increase rare-class counts, "
+                    f"failing_class_counts={failing_class_counts}. "
+                    "Add data or increase rare-class counts, "
                     "or set split_config.stratify=false explicitly."
                 )
             return class_counts
@@ -790,27 +793,36 @@ def automl_data_loader(  # noqa: D417
 
             first_counts = {label: int(count) for label, count in first_y.value_counts(dropna=False).items()}
             second_counts = {label: int(count) for label, count in second_y.value_counts(dropna=False).items()}
-            failing_classes = {
-                label: {sides[0]: first_counts.get(label, 0), sides[1]: second_counts.get(label, 0)}
-                for label in class_counts
+            failing_allocations = [
+                {
+                    "class_count": count,
+                    sides[0]: first_counts.get(label, 0),
+                    sides[1]: second_counts.get(label, 0),
+                }
+                for label, count in class_counts.items()
                 if not first_counts.get(label, 0) or not second_counts.get(label, 0)
-            }
+            ]
+            class_sizes = sorted(class_counts.values(), reverse=True)
+            first_sizes = sorted(first_counts.values(), reverse=True)
+            second_sizes = sorted(second_counts.values(), reverse=True)
             logger.info(
-                "Stratified split allocation [%s]: %s=%s, %s=%s, viable=%s",
+                "Stratified split allocation [%s]: n_classes=%s, %s_class_counts=%s, %s_class_counts=%s, viable=%s",
                 stage,
+                len(class_counts),
                 sides[0],
-                first_counts,
+                first_sizes,
                 sides[1],
-                second_counts,
-                not failing_classes,
+                second_sizes,
+                not failing_allocations,
             )
-            if failing_classes:
+            if failing_allocations:
                 raise ValueError(
                     f"Stratified {stage} split is not viable after allocation: "
-                    f"class_counts={class_counts}, test_size={test_size}, "
+                    f"class_counts={class_sizes}, test_size={test_size}, "
                     f"selection_train_size={selection_train_size}, "
-                    f"{sides[0]}_class_counts={first_counts}, {sides[1]}_class_counts={second_counts}, "
-                    f"failing_classes={failing_classes}. Each class needs at least one row on both sides. "
+                    f"{sides[0]}_class_counts={first_sizes}, {sides[1]}_class_counts={second_sizes}, "
+                    f"failing_class_allocations={failing_allocations}. "
+                    "Each class needs at least one row on both sides. "
                     "Add data or increase rare-class counts, or set split_config.stratify=false explicitly."
                 )
 

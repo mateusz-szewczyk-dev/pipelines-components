@@ -1085,7 +1085,7 @@ class TestUserProvidedTestData:
                     test_data_file_key="data/test.csv",
                 )
 
-        assert "'B': 2" in str(exc_info.value)
+        assert "'class_count': 2" in str(exc_info.value)
         assert f"selection_train_size={selection_train_size}" in str(exc_info.value)
         assert "'selection': 0" in str(exc_info.value)
         assert len(split_calls) == 1
@@ -1548,7 +1548,7 @@ class TestDataLoaderSplitLogic:
         assert expected_message in str(exc_info.value)
 
     @mock.patch.dict("os.environ", mocked_env_variables)
-    def test_holdout_singleton_fails_before_split(self, tmp_path):
+    def test_holdout_singleton_fails_before_split(self, tmp_path, caplog):
         """A singleton fails the sklearn floor before the split runs."""
         split_calls = []
 
@@ -1556,7 +1556,9 @@ class TestDataLoaderSplitLogic:
             split_calls.append(kwargs)
             return _mock_train_test_split(*args, **kwargs)
 
-        body_stream = _csv_body(_classification_csv(["A"] * 100 + ["B"]), pad=False)
+        sensitive_label = "patient@example.com"
+        body_stream = _csv_body(_classification_csv(["A"] * 100 + [sensitive_label]), pad=False)
+        caplog.set_level("INFO")
         with _mock_boto3_pandas_custom_train_test_split(tracking_split, get_object_return={"Body": body_stream}):
             with pytest.raises(ValueError, match="Stratified holdout split is not viable") as exc_info:
                 automl_data_loader.python_func(
@@ -1571,16 +1573,19 @@ class TestDataLoaderSplitLogic:
 
         message = str(exc_info.value)
         assert "class_counts=" in message
-        assert "'B': 1" in message
+        assert "class_counts=[100, 1]" in message
         assert "test_size=0.2" in message
         assert "selection_train_size=0.3" in message
         assert "minimum_per_class=2" in message
-        assert "failing_classes=" in message
+        assert "failing_class_counts=[1]" in message
         assert "split_config.stratify=false" in message
+        assert sensitive_label not in message
+        assert sensitive_label not in caplog.text
+        assert sensitive_label not in (tmp_path / "component_status" / "component_status.json").read_text()
         assert split_calls == []
 
     @mock.patch.dict("os.environ", mocked_env_variables)
-    def test_holdout_allocation_missing_class_fails_after_split(self, tmp_path):
+    def test_holdout_allocation_missing_class_fails_after_split(self, tmp_path, caplog):
         """A class omitted by the actual allocation is reported before export."""
         split_calls = []
 
@@ -1588,7 +1593,9 @@ class TestDataLoaderSplitLogic:
             split_calls.append(kwargs)
             return _mock_train_test_split(*args, **kwargs)
 
-        body_stream = _csv_body(_classification_csv(["A"] * 97 + ["B"] * 2 + ["C"] * 2), pad=False)
+        sensitive_label = "patient@example.com"
+        body_stream = _csv_body(_classification_csv(["A"] * 97 + [sensitive_label] * 2 + ["C"] * 2), pad=False)
+        caplog.set_level("INFO")
         with _mock_boto3_pandas_custom_train_test_split(tracking_split, get_object_return={"Body": body_stream}):
             with pytest.raises(ValueError, match="Stratified holdout split is not viable after allocation") as exc_info:
                 automl_data_loader.python_func(
@@ -1601,9 +1608,11 @@ class TestDataLoaderSplitLogic:
                     task_type="multiclass",
                 )
 
-        assert "'B': 2" in str(exc_info.value)
-        assert "'C': 2" in str(exc_info.value)
+        assert str(exc_info.value).count("'class_count': 2") == 2
         assert "'train': 0" in str(exc_info.value)
+        assert sensitive_label not in str(exc_info.value)
+        assert sensitive_label not in caplog.text
+        assert sensitive_label not in (tmp_path / "component_status" / "component_status.json").read_text()
         assert len(split_calls) == 1
 
     @mock.patch.dict("os.environ", mocked_env_variables)
@@ -1658,7 +1667,7 @@ class TestDataLoaderSplitLogic:
 
         message = str(exc_info.value)
         assert "test_size=0.7" in message or "test_size=0.69999999999999996" in message
-        assert "'B': 3" in message
+        assert "'class_count': 3" in message
         assert "'extra': 0" in message
         assert len(split_calls) == 2
         assert split_calls[0]["stratify"] is not None
