@@ -136,7 +136,7 @@ The `split_config` dictionary parameter supports:
 - **Binary / multiclass**: If `stratify` is `True` (default), the split is stratified by `label_column`; if `False`, the split is random.
 
 For classification with `stratify=True`, each class needs enough sampled training rows to appear on both sides of the holdout split and, afterward, on both sides of the selection/extra split.
-The loader raises a `ValueError` with class counts and the required minimum before training if either split is not viable.
+The loader raises a `ValueError` with class counts and the resulting allocation before training if either split is not viable.
 A user-provided test file skips the holdout check.
 
 The `selection_train_size` parameter (default: 0.3) controls the secondary split of the train portion:

@@ -724,7 +724,6 @@ def automl_data_loader(  # noqa: D417
         split_export_started = time.monotonic()
 
         # --- Train/test split ---
-        from decimal import Decimal
         from pathlib import Path
 
         from sklearn.model_selection import train_test_split
@@ -748,32 +747,71 @@ def automl_data_loader(  # noqa: D417
         stratify_effective = task_type != "regression" and split_config.get("stratify", True)
 
         def _assert_stratified_split_viable(y, *, test_size, stage):
-            """Require every class to fit on both sides of a stratified split."""
+            """Check sklearn's class and split-size requirements before splitting."""
             if not stratify_effective:
                 return
 
             class_counts = {label: int(count) for label, count in y.value_counts(dropna=False).items()}
-            split_fraction = Decimal(str(test_size))
-            min_per_class = max(2, math.ceil(1 / min(split_fraction, 1 - split_fraction)))
+            n_classes = len(class_counts)
+            # sklearn rounds a fractional test_size up before allocating classes.
+            test_rows = math.ceil(len(y) * test_size)
+            train_rows = len(y) - test_rows
+            min_per_class = 2
             failing_classes = {label: count for label, count in class_counts.items() if count < min_per_class}
             logger.info(
                 "Stratified split viability [%s]: class_counts=%s, test_size=%s, "
-                "selection_train_size=%s, minimum_per_class=%s, viable=%s",
+                "selection_train_size=%s, minimum_per_class=%s, n_classes=%s, "
+                "train_rows=%s, test_rows=%s, viable=%s",
                 stage,
                 class_counts,
                 test_size,
                 selection_train_size,
                 min_per_class,
+                n_classes,
+                train_rows,
+                test_rows,
+                not failing_classes and train_rows >= n_classes and test_rows >= n_classes,
+            )
+            if failing_classes or train_rows < n_classes or test_rows < n_classes:
+                raise ValueError(
+                    f"Stratified {stage} split is not viable: class_counts={class_counts}, "
+                    f"test_size={test_size}, selection_train_size={selection_train_size}, "
+                    f"minimum_per_class={min_per_class}, n_classes={n_classes}, "
+                    f"train_rows={train_rows}, test_rows={test_rows}, "
+                    f"failing_classes={failing_classes}. Add data or increase rare-class counts, "
+                    "or set split_config.stratify=false explicitly."
+                )
+            return class_counts
+
+        def _assert_stratified_split_coverage(class_counts, first_y, second_y, *, test_size, stage, sides):
+            """Check the classes actually allocated by the stratified split."""
+            if not stratify_effective:
+                return
+
+            first_counts = {label: int(count) for label, count in first_y.value_counts(dropna=False).items()}
+            second_counts = {label: int(count) for label, count in second_y.value_counts(dropna=False).items()}
+            failing_classes = {
+                label: {sides[0]: first_counts.get(label, 0), sides[1]: second_counts.get(label, 0)}
+                for label in class_counts
+                if not first_counts.get(label, 0) or not second_counts.get(label, 0)
+            }
+            logger.info(
+                "Stratified split allocation [%s]: %s=%s, %s=%s, viable=%s",
+                stage,
+                sides[0],
+                first_counts,
+                sides[1],
+                second_counts,
                 not failing_classes,
             )
             if failing_classes:
                 raise ValueError(
-                    f"Stratified {stage} split is not viable: class_counts={class_counts}, "
-                    f"test_size={test_size}, selection_train_size={selection_train_size}, "
-                    f"minimum_per_class={min_per_class} (at least 2 for sklearn and "
-                    "enough for each class on both sides), "
-                    f"failing_classes={failing_classes}. Add data or increase rare-class counts, "
-                    "or set split_config.stratify=false explicitly."
+                    f"Stratified {stage} split is not viable after allocation: "
+                    f"class_counts={class_counts}, test_size={test_size}, "
+                    f"selection_train_size={selection_train_size}, "
+                    f"{sides[0]}_class_counts={first_counts}, {sides[1]}_class_counts={second_counts}, "
+                    f"failing_classes={failing_classes}. Each class needs at least one row on both sides. "
+                    "Add data or increase rare-class counts, or set split_config.stratify=false explicitly."
                 )
 
         has_user_test_data = bool(test_data_file_key)
@@ -863,13 +901,16 @@ def automl_data_loader(  # noqa: D417
             X = sampled_dataframe.drop(columns=[label_column], inplace=False)
             y = sampled_dataframe[label_column]
 
-            _assert_stratified_split_viable(y, test_size=test_size, stage="holdout")
+            class_counts = _assert_stratified_split_viable(y, test_size=test_size, stage="holdout")
             X_train, X_test, y_train, y_test = train_test_split(
                 X,
                 y,
                 test_size=test_size,
                 stratify=(y if stratify_effective else None),
                 random_state=random_state,
+            )
+            _assert_stratified_split_coverage(
+                class_counts, y_train, y_test, test_size=test_size, stage="holdout", sides=("train", "test")
             )
 
             selection_X = X_train
@@ -881,13 +922,24 @@ def automl_data_loader(  # noqa: D417
         eligible_train_rows = len(selection_X)
         eligible_train_bytes = _memory_usage_bytes(selection_X) + _memory_usage_bytes(selection_y)
 
-        _assert_stratified_split_viable(selection_y, test_size=(1 - selection_train_size), stage="selection_extra")
+        selection_extra_test_size = 1 - selection_train_size
+        class_counts = _assert_stratified_split_viable(
+            selection_y, test_size=selection_extra_test_size, stage="selection_extra"
+        )
         X_sel, X_extra, y_sel, y_extra = train_test_split(
             selection_X,
             selection_y,
-            test_size=(1 - selection_train_size),
+            test_size=selection_extra_test_size,
             stratify=(selection_y if stratify_effective else None),
             random_state=random_state,
+        )
+        _assert_stratified_split_coverage(
+            class_counts,
+            y_sel,
+            y_extra,
+            test_size=selection_extra_test_size,
+            stage="selection_extra",
+            sides=("selection", "extra"),
         )
 
         X_y_sel = pd.concat([X_sel, y_sel], axis=1)
