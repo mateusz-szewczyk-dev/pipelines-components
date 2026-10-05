@@ -247,8 +247,6 @@ def autogluon_tabular_training_pipeline(
         )
 
     def _mount_training_scratch(task, size: str):
-        # A generic ephemeral PVC requests capacity before the pod runs. An emptyDir
-        # sizeLimit would cap usage without reserving any space on the node.
         add_ephemeral_volume(
             task,
             volume_name="autogluon-scratch",
