@@ -14,7 +14,6 @@ from ..pipeline import autogluon_timeseries_training_pipeline
 _EXPECTED_ROOT_DAG_TASK_IDS = (
     "condition-branches-1",
     "publish-component-stage-map",
-    "timeseries-data-loader",
 )
 
 
@@ -42,7 +41,7 @@ class TestAutogluonTimeseriesTrainingPipelineUnitTests:
             Path(tmp_path).unlink(missing_ok=True)
 
     def test_training_branches_mount_local_scratch(self):
-        """Both preset branches mount disk-backed scratch for selection training."""
+        """Every preset branch mounts disk-backed scratch for selection training."""
         import yaml
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as tmp_file:
@@ -56,7 +55,8 @@ class TestAutogluonTimeseriesTrainingPipelineUnitTests:
         executors = platform["platforms"]["kubernetes"]["deploymentSpec"]["executors"]
         for name, size_limit in (
             ("exec-autogluon-timeseries-models-training", "32Gi"),
-            ("exec-autogluon-timeseries-models-training-2", "16Gi"),
+            ("exec-autogluon-timeseries-models-training-2", "64Gi"),
+            ("exec-autogluon-timeseries-models-training-3", "16Gi"),
         ):
             assert executors[name]["emptyDirMounts"] == [
                 {"volumeName": "autogluon-scratch", "mountPath": "/tmp/autogluon-scratch", "sizeLimit": size_limit}
@@ -230,8 +230,8 @@ class TestAutogluonTimeseriesTrainingPipelineUnitTests:
         assert "componentInputParameter: test_data_bucket_name" in content
         assert "componentInputParameter: test_data_file_key" in content
 
-    def test_compiled_pipeline_uses_single_train_secret_mount(self):
-        """Train secret is mounted once; test data reuses AWS_* via component fallback."""
+    def test_compiled_pipeline_uses_conditional_train_secret_mounts(self):
+        """Each conditional loader mounts the shared train secret."""
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as tmp_file:
             tmp_path = tmp_file.name
         try:
@@ -245,6 +245,6 @@ class TestAutogluonTimeseriesTrainingPipelineUnitTests:
 
         assert "condition-1" not in content
         assert "TEST_DATA_AWS_ACCESS_KEY_ID" not in content
-        train_secret_block = content.split("envVar: AWS_ACCESS_KEY_ID", 1)[1]
-        assert "optional: true" in train_secret_block[:500]
-        assert "componentInputParameter: train_data_secret_name" in train_secret_block[:500]
+        assert content.count("envVar: AWS_ACCESS_KEY_ID") == 3
+        assert "optional: true" in content
+        assert "pipelinechannel--train_data_secret_name" in content

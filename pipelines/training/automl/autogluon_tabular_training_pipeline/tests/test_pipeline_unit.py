@@ -14,7 +14,6 @@ from ..pipeline import autogluon_tabular_training_pipeline
 # Root DAG task IDs from ``root.dag.tasks`` (fresh compile). Update when the graph changes.
 _EXPECTED_ROOT_DAG_TASK_IDS = (
     "condition-branches-1",
-    "automl-data-loader",
     "publish-component-stage-map",
 )
 
@@ -43,7 +42,7 @@ class TestAutogluonTabularTrainingPipelineUnitTests:
             Path(tmp_path).unlink(missing_ok=True)
 
     def test_training_branches_mount_local_scratch(self):
-        """Both preset branches mount task-local storage for AutoGluon."""
+        """Every preset branch mounts task-local storage for AutoGluon."""
         import yaml
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as tmp_file:
@@ -57,11 +56,25 @@ class TestAutogluonTabularTrainingPipelineUnitTests:
         executors = platform["platforms"]["kubernetes"]["deploymentSpec"]["executors"]
         for name, size_limit in (
             ("exec-autogluon-models-training", "64Gi"),
-            ("exec-autogluon-models-training-2", "32Gi"),
+            ("exec-autogluon-models-training-2", "128Gi"),
+            ("exec-autogluon-models-training-3", "32Gi"),
         ):
             assert executors[name]["emptyDirMounts"] == [
                 {"volumeName": "autogluon-scratch", "mountPath": "/tmp/autogluon-scratch", "sizeLimit": size_limit}
             ]
+
+    def test_pipeline_declares_32_gib_shared_workspace(self):
+        """All preset branches share the 32 GiB PVC required by quality."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as tmp_file:
+            tmp_path = tmp_file.name
+        try:
+            compiler.Compiler().compile(
+                pipeline_func=autogluon_tabular_training_pipeline,
+                package_path=tmp_path,
+            )
+            assert "size: 32Gi" in Path(tmp_path).read_text(encoding="utf-8")
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
 
     def test_pipeline_signature(self):
         """Test that the pipeline has the expected parameters."""
@@ -199,8 +212,8 @@ class TestAutogluonTabularTrainingPipelineUnitTests:
         assert "componentInputParameter: preset" in content
         assert "condition-branches-1" in content
 
-    def test_compiled_pipeline_declares_speed_and_balanced_resource_tiers(self):
-        """Speed and balanced preset branches request different training CPU/memory."""
+    def test_compiled_pipeline_declares_all_preset_resource_tiers(self):
+        """Speed, balanced, and large-tabular preset branches request distinct resources."""
         from kfp_components.utils.pipeline_task_resources import (
             assert_executor_resources,
             compile_executor_resources,
@@ -214,6 +227,7 @@ class TestAutogluonTabularTrainingPipelineUnitTests:
             {
                 "autogluon-models-training": AUTOML_TABULAR_EXECUTOR_RESOURCES["autogluon-models-training"],
                 "autogluon-models-training-2": AUTOML_TABULAR_EXECUTOR_RESOURCES["autogluon-models-training-2"],
+                "autogluon-models-training-3": AUTOML_TABULAR_EXECUTOR_RESOURCES["autogluon-models-training-3"],
             },
             pipeline_name="autogluon_tabular_training_pipeline (training tiers only)",
             allow_extra=True,
@@ -276,8 +290,8 @@ class TestAutogluonTabularTrainingPipelineUnitTests:
         assert "componentInputParameter: test_data_bucket_name" in content
         assert "componentInputParameter: test_data_file_key" in content
 
-    def test_compiled_pipeline_uses_single_train_secret_mount(self):
-        """Train secret is mounted once; test data reuses AWS_* via component fallback."""
+    def test_compiled_pipeline_uses_conditional_train_secret_mounts(self):
+        """Each conditional loader mounts the shared train secret."""
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as tmp_file:
             tmp_path = tmp_file.name
         try:
@@ -291,6 +305,6 @@ class TestAutogluonTabularTrainingPipelineUnitTests:
 
         assert "condition-1" not in content
         assert "TEST_DATA_AWS_ACCESS_KEY_ID" not in content
-        train_secret_block = content.split("envVar: AWS_ACCESS_KEY_ID", 1)[1]
-        assert "optional: true" in train_secret_block[:500]
-        assert "componentInputParameter: train_data_secret_name" in train_secret_block[:500]
+        assert content.count("envVar: AWS_ACCESS_KEY_ID") == 3
+        assert "optional: true" in content
+        assert "pipelinechannel--train_data_secret_name" in content
