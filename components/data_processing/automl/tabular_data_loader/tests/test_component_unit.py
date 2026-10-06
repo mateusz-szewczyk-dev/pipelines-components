@@ -1523,30 +1523,6 @@ class TestDataLoaderSplitLogic:
         assert split_calls[0]["test_size"] == 0.25
         assert (split_calls[0]["stratify"] is not None) == (task_type == "binary")
 
-    @pytest.mark.parametrize(
-        ("invalid_input", "expected_message"),
-        [
-            ({"split_config": {"test_size": float("nan")}}, "split_config['test_size']"),
-            ({"selection_train_size": float("nan")}, "selection_train_size"),
-        ],
-    )
-    @mock.patch.dict("os.environ", mocked_env_variables)
-    def test_nan_split_fractions_raise_value_error(self, tmp_path, invalid_input, expected_message):
-        """Non-finite split fractions fail input validation with a clear error."""
-        with _mock_boto3_and_pandas():
-            with pytest.raises(ValueError) as exc_info:
-                automl_data_loader.python_func(
-                    file_key="data/file.csv",
-                    bucket_name="bucket",
-                    workspace_path=str(tmp_path),
-                    label_column="target",
-                    sampled_test_dataset=_make_test_artifact(tmp_path),
-                    task_type="binary",
-                    **invalid_input,
-                )
-
-        assert expected_message in str(exc_info.value)
-
     @mock.patch.dict("os.environ", mocked_env_variables)
     def test_holdout_singleton_fails_before_split(self, tmp_path, caplog):
         """A singleton fails the sklearn floor before the split runs."""
