@@ -4,10 +4,10 @@ stability: alpha
 dependencies:
   kubeflow:
     - name: Pipelines
-      version: '>=2.15.2'
+      version: '>=2.16.1'
 tags:
   - training
   - timeseries
   - automl
   - model-selection
-lastVerified: 2026-09-30T00:00:00Z
+lastVerified: 2026-10-06T00:00:00Z

@@ -1093,7 +1093,7 @@ class TestAutogluonModelsTrainingUnitTests:
     @mock.patch("pandas.read_parquet")
     @mock.patch("autogluon.tabular.TabularPredictor")
     def test_operations_called_in_correct_order(self, mock_predictor_class, mock_read_parquet, mock_rmtree, tmp_path):
-        """Verify call order for a single model: fit → clone → refit_full → Phase A (predict → evaluate → fi) → Phase B (set_model_best → clone_for_deployment) → rmtree.
+        """Verify fit, pruning, clone, refit, evaluation, deployment, and cleanup ordering.
 
         Phase A (metrics + notebook) runs via ThreadPoolExecutor across models, but within
         a single model's _process_model the calls are always sequential: predict first, then
@@ -1104,6 +1104,7 @@ class TestAutogluonModelsTrainingUnitTests:
         mock_predictor_clone = mock.MagicMock()
 
         mock_predictor_class.return_value.fit.side_effect = lambda **kw: (call_order.append("fit"), mock_predictor)[1]
+        mock_predictor.delete_models.side_effect = lambda **kw: call_order.append("delete_models")
         mock_predictor.clone.side_effect = lambda **kw: (call_order.append("clone"), mock_predictor_clone)[1]
         mock_predictor_clone.refit_full.side_effect = lambda **kw: call_order.append("refit_full")
         mock_predictor_clone.predict.side_effect = lambda df, model: (
@@ -1154,15 +1155,16 @@ class TestAutogluonModelsTrainingUnitTests:
 
         # Global ordering invariants (single model, so no inter-model concurrency to worry about)
         assert call_order[0] == "fit"
-        assert call_order[1] == "clone"
-        assert call_order[2] == "refit_full"
+        assert call_order[1] == "delete_models"
+        assert call_order[2] == "clone"
+        assert call_order[3] == "refit_full"
         # Phase A: within _process_model calls are sequential
-        assert call_order[3] == "predict"
-        assert call_order[4] == "evaluate_predictions"
-        assert call_order[5] == "feature_importance"
+        assert call_order[4] == "predict"
+        assert call_order[5] == "evaluate_predictions"
+        assert call_order[6] == "feature_importance"
         # Phase B: always after all Phase A work completes
-        assert call_order[6] == "set_model_best"
-        assert call_order[7] == "clone_for_deployment"
+        assert call_order[7] == "set_model_best"
+        assert call_order[8] == "clone_for_deployment"
         assert call_order[-1] == "rmtree"
 
     @mock.patch("pandas.read_parquet")
@@ -1237,6 +1239,53 @@ class TestAutogluonModelsTrainingUnitTests:
         assert scratch_path.parent == Path("/tmp/autogluon-scratch")
         assert not scratch_path.exists()
         assert list(workspace_path.iterdir()) == []
+
+    @mock.patch("pandas.read_parquet")
+    @mock.patch("autogluon.tabular.TabularPredictor")
+    @pytest.mark.parametrize("failed_operation", ["delete_models", "clone", "refit_full"])
+    def test_scratch_is_cleaned_when_refit_preparation_or_refit_fails(
+        self, mock_predictor_class, mock_read_parquet, tmp_path, failed_operation
+    ):
+        """Failures after selection clean up library temporary files and predictor data."""
+        import errno
+        import tempfile
+
+        predictor = mock.MagicMock(problem_type="regression", label="target", eval_metric="r2")
+        predictor_clone = mock.MagicMock()
+        predictor.clone.return_value = predictor_clone
+        _mock_leaderboard_top_models(predictor, ["LightGBM_BAG_L1"])
+        temporary_paths = []
+        original_temp_settings = {name: os.environ.get(name) for name in ("TMPDIR", "RAY_TMPDIR")}
+
+        def fit(**kwargs):
+            predictor_path = mock_predictor_class.call_args.kwargs["path"]
+            predictor_path.mkdir()
+            (predictor_path / "predictor.pkl").write_bytes(b"model")
+            with tempfile.NamedTemporaryFile(delete=False) as temporary_file:
+                temporary_paths.append(Path(temporary_file.name))
+            return predictor
+
+        mock_predictor_class.return_value.fit.side_effect = fit
+        failing_predictor = predictor_clone if failed_operation == "refit_full" else predictor
+        getattr(failing_predictor, failed_operation).side_effect = OSError(errno.ENOSPC, "No space left on device")
+        mock_read_parquet.side_effect = [_mock_parquet_frame(), _mock_parquet_frame(), _mock_parquet_frame()]
+        workspace_path = tmp_path / "ws"
+        workspace_path.mkdir()
+        models_artifact = mock.MagicMock(path=str(tmp_path / "out"), metadata={})
+
+        with pytest.raises(OSError, match="No space left on device"):
+            autogluon_models_training.python_func(
+                **_base_call_kwargs(
+                    str(workspace_path), models_artifact, mock.MagicMock(path="/tmp/test.parquet"), tmp_path
+                )
+            )
+
+        scratch_path = mock_predictor_class.call_args.kwargs["path"].parent
+        assert not scratch_path.exists()
+        assert temporary_paths and temporary_paths[0].parent == scratch_path
+        assert not temporary_paths[0].exists()
+        assert list(workspace_path.iterdir()) == []
+        assert {name: os.environ.get(name) for name in original_temp_settings} == original_temp_settings
 
     @mock.patch("pandas.read_parquet")
     def test_symlink_scratch_root_is_rejected(self, mock_read_parquet, tmp_path):
@@ -1339,6 +1388,8 @@ class TestAutogluonModelsTrainingUnitTests:
         )
 
         mock_predictor_clone.refit_full.assert_called_once_with(model=top_models, train_data_extra=None, num_cpus=4)
+        mock_predictor.delete_models.assert_called_once_with(models_to_keep=top_models, dry_run=False)
+        mock_predictor.save_space.assert_not_called()
         # clone also called exactly once (not per model)
         mock_predictor.clone.assert_called_once()
 

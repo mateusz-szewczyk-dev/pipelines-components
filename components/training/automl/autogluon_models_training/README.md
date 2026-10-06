@@ -54,11 +54,11 @@ mutates predictor state. All artifacts are written under a single output artifac
 - **Stability**: alpha
 - **Dependencies**:
   - Kubeflow:
-    - Name: Pipelines, Version: >=2.15.2
+    - Name: Pipelines, Version: >=2.16.1
 - **Tags**:
   - training
   - automl
-- **Last Verified**: 2026-09-29 00:00:00+00:00
+- **Last Verified**: 2026-10-06 00:00:00+00:00
 - **Owners**:
   - No Parent Owners: Yes
   - Approvers:
@@ -83,8 +83,12 @@ when completed), ``refit_and_evaluate``. Artifact metadata display name:
 This component is typically used inside a KFP pipeline. The shared PVC holds the two training splits,
 and a test dataset artifact supplies leaderboard evaluation data. The predictor and refit clone use
 task-local scratch storage under `/tmp/autogluon-scratch`; both must be on a normal local filesystem
-because AutoGluon's clone operation can drop files on S3 FUSE. The tabular pipeline mounts a disk-backed
-`emptyDir` there. Scratch is removed when training succeeds or fails.
+because AutoGluon's clone operation can drop files on S3 FUSE. The tabular pipeline mounts a generic
+ephemeral PVC there. Before cloning, the component removes models outside the top N while preserving
+the selected models' dependencies and the cached data needed for refit. Python and Ray temporary
+files use the same scratch directory. Filesystem capacity, usage, and free space are logged at stage
+boundaries and before cleanup. Scratch is removed when training succeeds or fails; cleanup failures
+are logged without masking the training error.
 
 ### Regression
 

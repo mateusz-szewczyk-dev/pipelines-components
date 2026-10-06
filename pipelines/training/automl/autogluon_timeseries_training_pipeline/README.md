@@ -64,14 +64,14 @@ to a single combined ``models_artifact``.
 - **Managed**: Yes
 - **Dependencies**:
   - Kubeflow:
-    - Name: Pipelines, Version: 2.16.1
+    - Name: Pipelines, Version: >=2.16.1
     - Name: Kubernetes, Version: >=1.28.0
 - **Tags**:
   - training
   - pipeline
   - automl
   - autogluon-timeseries-training-pipeline
-- **Last Verified**: 2026-09-30 00:00:00+00:00
+- **Last Verified**: 2026-10-06 00:00:00+00:00
 - **Owners**:
   - No Parent Owners: Yes
   - Approvers:
@@ -89,10 +89,12 @@ StorageClass and mount it at `/tmp/autogluon-scratch`. The `speed` branch reques
 `balanced` 32Gi, and `quality` 64Gi. The claim must be provisioned before training starts,
 so scratch capacity is accounted for rather than relying on an `emptyDir` size limit. The
 default StorageClass must support dynamic provisioning of these claims.
+Python and Ray temporary files also use scratch. Capacity, usage, and free space are logged
+at stage boundaries and before cleanup; these snapshots do not measure peaks between stages.
 These sizes are provisional; measure peak scratch usage for each preset on representative
 datasets and adjust the requests with headroom. Image writable layers and logs still consume
-node-local ephemeral storage. KFP 2.16.1 cannot set that resource request or limit on a task,
-so the cluster needs a separate reserve for this overhead.
+node-local ephemeral storage. The pipeline does not request or limit node-local ephemeral
+storage for this overhead, so the cluster needs a separate reserve.
 The selection predictor stays on that task-local filesystem and is removed after success or
 failure. The shared workspace holds only the two Parquet training splits needed between loading
 and training. Refitted predictors are saved in the model artifact.

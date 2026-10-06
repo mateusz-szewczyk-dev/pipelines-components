@@ -81,14 +81,14 @@ The pipeline leverages AutoGluon's unique ensembling strategy that combines mult
 - **Managed**: Yes
 - **Dependencies**:
   - Kubeflow:
-    - Name: Pipelines, Version: 2.16.1
+    - Name: Pipelines, Version: >=2.16.1
     - Name: Kubernetes, Version: >=1.28.0
 - **Tags**:
   - training
   - pipeline
   - automl
   - autogluon-tabular-training-pipeline
-- **Last Verified**: 2026-09-29 00:00:00+00:00
+- **Last Verified**: 2026-10-06 00:00:00+00:00
 - **Owners**:
   - No Parent Owners: Yes
   - Approvers:
@@ -108,15 +108,19 @@ StorageClass and mount it at `/tmp/autogluon-scratch`. The `speed` branch reques
 `balanced` 64Gi, and `quality` 128Gi. The claim must be provisioned before training starts,
 so scratch capacity is accounted for rather than relying on an `emptyDir` size limit. The
 default StorageClass must support dynamic provisioning of these claims.
-The volume holds the initial predictor and its full clone at the same time; the clone grows
-during refitting. These sizes are provisional; measure peak scratch usage for each preset
+The volume holds the initial predictor and its clone at the same time; the clone grows
+during refitting. Before cloning, models outside the top N are removed while retaining all
+dependencies needed by the selected ensembles and cached training data required for refit.
+Python and Ray temporary files also use scratch. Capacity, usage, and free space are logged
+at stage boundaries and before cleanup; these snapshots do not measure peaks between stages.
+These sizes are provisional; measure peak scratch usage for each preset
 on representative datasets and adjust the requests with headroom.
 The initial predictor and the refit clone stay on this task-local filesystem so
 AutoGluon's clone operation does not copy through S3 FUSE. The training component
 removes its scratch directory on success and failure. The shared workspace holds
 only the two Parquet training splits needed between loading and training. Image writable
-layers and logs still consume node-local ephemeral storage. KFP 2.16.1 cannot set that
-resource request or limit on a task, so the cluster needs a separate reserve for this overhead.
+layers and logs still consume node-local ephemeral storage. The pipeline does not request
+or limit node-local ephemeral storage for this overhead, so the cluster needs a separate reserve.
 
 ### Progress and dashboard artifacts
 

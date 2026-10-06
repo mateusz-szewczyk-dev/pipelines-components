@@ -114,13 +114,13 @@ def example_pipeline(
 - **Stability**: alpha
 - **Dependencies**:
   - Kubeflow:
-    - Name: Pipelines, Version: >=2.15.2
+    - Name: Pipelines, Version: >=2.16.1
 - **Tags**:
   - training
   - timeseries
   - automl
   - model-selection
-- **Last Verified**: 2026-09-30 00:00:00+00:00
+- **Last Verified**: 2026-10-06 00:00:00+00:00
 - **Owners**:
   - No Parent Owners: Yes
   - Approvers:
@@ -136,8 +136,10 @@ def example_pipeline(
 ### Training scratch storage
 
 The selection predictor uses task-local scratch under `/tmp/autogluon-scratch`, mounted as a
-disk-backed `emptyDir` by the time series pipeline. The component removes this scratch directory
-after success or failure. The shared PVC holds only the two Parquet training splits; each refitted
+generic ephemeral PVC by the time series pipeline. Python and Ray temporary files use the same
+scratch directory. Filesystem capacity, usage, and free space are logged at stage boundaries and
+before cleanup. The component removes scratch after success or failure; cleanup failures are logged
+without masking the training error. The shared PVC holds only the two Parquet training splits; each refitted
 predictor is saved in `models_artifact`. The `predictor_path` output points to the best refitted
 predictor in that artifact.
 

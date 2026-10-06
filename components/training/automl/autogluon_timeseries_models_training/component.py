@@ -104,9 +104,6 @@ def autogluon_timeseries_models_training(
     import json
     import logging
     import math
-    import shutil
-    import stat
-    import tempfile
     import time
     from contextlib import ExitStack
     from pathlib import Path
@@ -116,6 +113,10 @@ def autogluon_timeseries_models_training(
     from autogluon.timeseries.metrics import AVAILABLE_METRICS, METRIC_ALIASES
     from kfp_components.components.training.automl.shared.component_status import ComponentStatusTracker
     from kfp_components.components.training.automl.shared.run_status import shared_automl_dir
+    from kfp_components.components.training.automl.shared.training_scratch import (
+        log_scratch_usage,
+        training_scratch,
+    )
 
     logger = logging.getLogger(__name__)
 
@@ -222,13 +223,8 @@ def autogluon_timeseries_models_training(
         )
 
         # Selection models are temporary. Keep them off the shared PVC and artifact
-        # store; the pipeline mounts a disk-backed emptyDir here for this task.
-        scratch_root = Path("/tmp/autogluon-scratch")
-        scratch_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if stat.S_ISLNK(scratch_root.lstat().st_mode):
-            raise PermissionError(f"Unsafe scratch directory: {scratch_root}")
-        scratch_path = Path(tempfile.mkdtemp(prefix="training-", dir=scratch_root))
-        cleanup_stack.callback(shutil.rmtree, scratch_path, ignore_errors=True)
+        # store; the pipeline mounts a generic ephemeral PVC here for this task.
+        scratch_path = cleanup_stack.enter_context(training_scratch(logger))
         predictor_path = scratch_path / "timeseries_predictor"
 
         # Create TimeSeriesPredictor
@@ -264,6 +260,7 @@ def autogluon_timeseries_models_training(
             logger.error(f"Training failed: {str(e)}")
             raise ValueError(f"TimeSeriesPredictor training failed: {str(e)}") from e
         total_fit_time_seconds += time.perf_counter() - fit_start_time
+        log_scratch_usage(scratch_path, logger, "after_selection")
 
         try:
             leaderboard = predictor.leaderboard(test_ts)
@@ -493,6 +490,7 @@ def autogluon_timeseries_models_training(
                         excluded_model_types=["Chronos", "Chronos2", "Toto"],
                     )
                     total_fit_time_seconds += time.perf_counter() - refit_start_time
+                    log_scratch_usage(scratch_path, logger, f"after_refit_{model_name}")
                     metrics = predictor_refit.evaluate(test_ts, metrics=list(AVAILABLE_METRICS.keys()))
                     # Keep raw AutoGluon evaluate() signs for metrics.json (higher-is-better / negated errors)
                     # so Phase C leaderboard sorting (ascending=False) stays correct.

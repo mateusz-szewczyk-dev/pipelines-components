@@ -110,9 +110,6 @@ def autogluon_models_training(
     import json
     import logging
     import math
-    import shutil
-    import stat
-    import tempfile
     import time
     from concurrent.futures import ThreadPoolExecutor
     from contextlib import ExitStack
@@ -131,6 +128,10 @@ def autogluon_models_training(
     from kfp_components.components.training.automl.shared.component_status import ComponentStatusTracker
     from kfp_components.components.training.automl.shared.mlflow_tracking import experiment_run_logger
     from kfp_components.components.training.automl.shared.run_status import shared_automl_dir
+    from kfp_components.components.training.automl.shared.training_scratch import (
+        log_scratch_usage,
+        training_scratch,
+    )
 
     VALID_TASK_TYPES = {"binary", "multiclass", "regression"}
     VALID_PRESETS = {"speed", "balanced", "quality"}
@@ -217,7 +218,7 @@ def autogluon_models_training(
 
     # Initialize status tracker
     status = ComponentStatusTracker(component_status.path, "autogluon_models_training")
-    with status:
+    with status, ExitStack() as cleanup_stack:
         status.set_metadata(display_name="Models Training Status")
         component_status.metadata["display_name"] = "Models Training Status"
 
@@ -263,13 +264,9 @@ def autogluon_models_training(
             )
 
         # Both the fit source and refit clone must be on a normal local filesystem.
-        # The pipeline mounts a disk-backed emptyDir here; standalone tasks use the
+        # The pipeline mounts a generic ephemeral PVC here; standalone tasks use the
         # container's writable filesystem at the same path.
-        scratch_root = Path("/tmp/autogluon-scratch")
-        scratch_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if stat.S_ISLNK(scratch_root.lstat().st_mode):
-            raise PermissionError(f"Unsafe scratch directory: {scratch_root}")
-        scratch_path = Path(tempfile.mkdtemp(prefix="training-", dir=scratch_root))
+        scratch_path = cleanup_stack.enter_context(training_scratch(logger))
         predictor_path = scratch_path / "autogluon_predictor"
         predictor_init_kwargs: dict[str, Any] = {
             "problem_type": task_type,
@@ -358,11 +355,17 @@ def autogluon_models_training(
             fit_kwargs.update(PRESET_FIT_KWARGS[preset])
             predictor = TabularPredictor(**predictor_init_kwargs).fit(**fit_kwargs)
             total_fit_time_seconds += time.perf_counter() - fit_start_time
+            log_scratch_usage(scratch_path, logger, "after_selection")
 
             # Select top N models
             leaderboard = predictor.leaderboard(test_data_df)
             logger.info("Leaderboard:\n\n %s", leaderboard.head(top_n).to_string())
             top_models = leaderboard.head(top_n)["model"].values.tolist()
+            # Keep only finalists and their stacking/ensemble dependencies before
+            # copying the predictor. AutoGluon resolves those dependencies itself.
+            # Keep cached training data and OOF predictions required by refit_full.
+            predictor.delete_models(models_to_keep=top_models, dry_run=False)
+            log_scratch_usage(scratch_path, logger, "after_pruning")
             # The live-progress callback creates a nested run for every candidate trained during
             # fit() (all bagged base models included); now that the leaderboard is known, drop the
             # runs for models outside the top-N so the MLflow experiment only shows the finalists.
@@ -413,12 +416,14 @@ def autogluon_models_training(
             # files during the shutil.copytree used by predictor.clone().
             work_path = predictor_path.parent / "refit_work"
             predictor_clone = predictor.clone(path=work_path, return_clone=True, dirs_exist_ok=True)
+            log_scratch_usage(scratch_path, logger, "after_clone")
 
             # Refit all top models in a single call:  AutoGluon resolves stacking dependencies internally.
             status.record("refit_and_evaluate", "started")
             refit_start_time = time.perf_counter()
             predictor_clone.refit_full(model=top_models, train_data_extra=extra_train_df, num_cpus=num_cpus)
             total_fit_time_seconds += time.perf_counter() - refit_start_time
+            log_scratch_usage(scratch_path, logger, "after_refit")
 
             def replace_placeholder_in_notebook(notebook, replacements):
                 for cell in notebook.get("cells", []):
@@ -982,10 +987,7 @@ def autogluon_models_training(
         finally:
             # Always end the MLflow parent run, even if training or artifact
             # processing raised, so it never leaks in RUNNING state (idempotent).
-            try:
-                mlflow_stack.close()
-            finally:
-                shutil.rmtree(scratch_path, ignore_errors=True)
+            mlflow_stack.close()
 
     return NamedTuple("outputs", eval_metric=str, best_model_name=str)(
         eval_metric=eval_metric,
