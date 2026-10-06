@@ -196,9 +196,7 @@ def automl_data_loader(  # noqa: D417
         raise ValueError("split_config must be a dictionary with possible keys test_size, random_state, stratify.")
     if isinstance(split_config, dict):
         test_size = split_config.get("test_size")
-        if test_size is not None and (
-            not isinstance(test_size, (int, float)) or test_size <= 0 or test_size >= 1 or not math.isfinite(test_size)
-        ):
+        if test_size is not None and (not isinstance(test_size, (int, float)) or test_size <= 0 or test_size >= 1):
             raise ValueError("split_config['test_size'] must be a number in (0, 1) when provided.")
         random_state = split_config.get("random_state")
         if random_state is not None and (not isinstance(random_state, int)):
@@ -208,7 +206,7 @@ def automl_data_loader(  # noqa: D417
             raise ValueError("split_config['stratify'] must be a boolean when provided.")
     if not isinstance(selection_train_size, (int, float)):
         raise ValueError("selection_train_size must be a numerical value.")
-    elif selection_train_size <= 0 or selection_train_size >= 1 or not math.isfinite(selection_train_size):
+    elif selection_train_size <= 0 or selection_train_size >= 1:
         raise ValueError("selection_train_size must be in a range 0 to 1.")
 
     test_data_bucket_name, test_data_file_key = validate_test_data_params(test_data_bucket_name, test_data_file_key)
