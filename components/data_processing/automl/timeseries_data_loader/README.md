@@ -6,12 +6,15 @@
 
 Load and split timeseries data from S3 for AutoGluon training.
 
-This component loads time series data from S3, samples it (up to 100 MiB for the ``"speed"`` preset, up to 1 GiB for ``"balanced"``, and up to 10 GiB for ``"quality"``), applies light **cleansing** (replace ``+/-inf`` with NaN so AutoGluon can apply its own missing-value logic; require parseable
-timestamps and non-null ids; drop exact duplicate ``(id_column, timestamp_column)`` rows, keep last), then performs a two-stage **per-series temporal** split for efficient AutoGluon training: 1. Primary split (default 80/20): for each distinct ``id_column`` value, the earliest (1 - test_size)
-fraction of rows by ``timestamp_column`` goes to the train portion and the remainder to the test set (so every series with at least two rows contributes holdout data; single-row series stay in train only). 2. Secondary split (default 30/70 of each series' train rows): early segment to
-selection-train, later segment to extra-train.
+This component scans the complete CSV and keeps the newest observations per series, using a bounded buffer (up to 100 MiB for the ``"speed"`` preset, up to 1 GiB for ``"balanced"``, and up to 10 GiB for ``"quality"``), applies light **cleansing** (replace ``+/-inf`` with NaN so AutoGluon can apply
+its own missing-value logic; require parseable timestamps and non-null ids; drop exact duplicate ``(id_column, timestamp_column)`` rows, keep last), then performs a two-stage **per-series temporal** split for efficient AutoGluon training: 1. Primary split (default 80/20): for each distinct
+``id_column`` value, the earliest (1 - test_size) fraction of rows by ``timestamp_column`` goes to the train portion and the remainder to the test set (so every series with at least two rows contributes holdout data; single-row series stay in train only). 2. Secondary split (default 30/70 of each
+series' train rows): early segment to selection-train, later segment to extra-train.
 
 The test set is written to an S3 artifact, while train Parquet files (selection-train and extra-train, Snappy-compressed) are written to the PVC workspace for sharing across pipeline steps.
+
+Unsorted input is supported: timestamps are validated before sampling and retained rows are sorted before splitting. Partial CSV reads fail. The existing component_status artifact records source and retained counts and time ranges in series_sampling_profile.json, with a summary of up to 50 series
+per dataset under metadata.sampling_profile.
 
 After cleansing, at least **100** valid records must remain; otherwise the component fails with a clear error so downstream AutoGluon training does not run on datasets too small to split reliably.
 
@@ -94,7 +97,7 @@ def example_pipeline(
   - timeseries
   - automl
   - data-loading
-- **Last Verified**: 2026-05-22 00:00:00+00:00
+- **Last Verified**: 2026-10-08 00:00:00+00:00
 - **Owners**:
   - No Parent Owners: Yes
   - Approvers:
@@ -114,3 +117,43 @@ In the time series training pipeline, this component writes ``component_status.j
 timestamps, and per-stage status (e.g. ``prepare_data``, ``split_and_export``).
 Dashboards align stage ids with ``component_stage_map.json`` from
 ``publish-component-stage-map``.
+
+### Sampling and source order
+
+The `last_values_per_series` policy reads the complete CSV once and retains each series'
+newest unique timestamps in a bounded buffer. Ascending, descending, shuffled, and interleaved
+inputs are supported; retained rows are sorted before splitting. Conflicting `(id, timestamp)`
+duplicates keep the last occurrence in file order. Invalid timestamps or incomplete reads fail
+instead of silently returning an old or partial history. External test CSVs use the same policy.
+
+A common row limit decreases as more series or larger rows are encountered. Conservative row
+costs include Python buffer overhead; short series can leave some budget unused. The CSV parser
+and exporting the retained frame require additional memory. A budget too small to retain even
+one observation per series fails explicitly.
+
+An observation too large to fit alone is represented by a timestamp marker. After the complete
+read, history up to the newest remaining marker is removed, keeping a contiguous latest tail.
+If the newest observation of a series cannot fit, the loader fails instead of returning older
+data. This rule also applies to external test CSVs and respects last-occurrence duplicates.
+
+The existing status artifact contains the full `series_sampling_profile.json`, with retained
+counts and timestamp ranges for `retained`, `selection_train`, `extra_train`, and `test`.
+The `retained` and `test` entries also include source counts (including duplicates), source
+timestamp ranges, and `oversized_rows_seen`. All retained counts reflect final unique rows.
+`component_status.json` includes up to 50 series per dataset under
+`metadata.sampling_profile.datasets`, plus `series_counts`, `profiles_truncated`, and the
+`profile_file` reference. No additional component parameter or output is required.
+`sample_config.source_rows_seen` records the complete source count; `sampled_rows` counts
+retained rows.
+
+Run the component and pipeline regression tests from the repository root:
+
+```bash
+uv run python -m scripts.tests.run_component_tests \
+  components/data_processing/automl/timeseries_data_loader \
+  pipelines/training/automl/autogluon_timeseries_training_pipeline
+```
+
+Tests cover per-series tails, input order, chunk boundaries, duplicates, oversized observations,
+full and bounded status profiles, external test sampling, and validation beyond the old head cutoff. Pandas/Parquet checks run
+when pandas and pyarrow are installed.

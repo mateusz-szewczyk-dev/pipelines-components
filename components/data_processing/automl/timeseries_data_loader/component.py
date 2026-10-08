@@ -35,7 +35,8 @@ def timeseries_data_loader(
 ):
     """Load and split timeseries data from S3 for AutoGluon training.
 
-    This component loads time series data from S3, samples it (up to 100 MiB for the
+    This component scans the complete CSV and keeps the newest observations per series,
+    using a bounded buffer (up to 100 MiB for the
     ``"speed"`` preset, up to 1 GiB for ``"balanced"``, and up to 10 GiB for
     ``"quality"``),
     applies light **cleansing** (replace ``+/-inf`` with NaN so AutoGluon can apply its
@@ -52,6 +53,11 @@ def timeseries_data_loader(
     The test set is written to an S3 artifact, while train Parquet files (selection-train
     and extra-train, Snappy-compressed) are written to the PVC workspace for sharing across
     pipeline steps.
+
+    Unsorted input is supported: timestamps are validated before sampling and retained rows
+    are sorted before splitting. Partial CSV reads fail. The existing component_status
+    artifact records source and retained counts and time ranges in series_sampling_profile.json,
+    with a summary of up to 50 series per dataset under metadata.sampling_profile.
 
     After cleansing, at least **100** valid records must remain; otherwise the component
     fails with a clear error so downstream AutoGluon training does not run on datasets too
@@ -91,9 +97,11 @@ def timeseries_data_loader(
         NamedTuple: sample_config, split_config, sample_rows, models_selection_train_data_path,
                    extra_train_data_path.
     """
+    import heapq
     import io
     import json
     import logging
+    import sys
     from pathlib import Path
 
     import boto3
@@ -127,7 +135,6 @@ def timeseries_data_loader(
     from kfp_components.components.training.automl.shared.parquet_utils import stringify_mixed_object_columns
     from kfp_components.components.training.automl.shared.user_test_data import (
         raise_if_test_data_empty,
-        report_test_data_truncation,
         resolve_s3_env_credentials,
         test_data_load_error,
         test_data_source_uri,
@@ -152,6 +159,7 @@ def timeseries_data_loader(
     MIN_VALID_RECORDS_AFTER_CLEANSING = 100
     PANDAS_CHUNK_SIZE = 10000  # Rows per batch for streaming read
     DEFAULT_TEST_SIZE = 0.2
+    MAX_SERIES_PROFILE = 50
 
     if preset not in VALID_PRESETS:
         raise ValueError(f"preset must be one of {sorted(VALID_PRESETS)}; got {preset!r}.")
@@ -239,16 +247,15 @@ def timeseries_data_loader(
             truncation_report=None,
             fail_on_partial_read: bool = False,
         ):
-            """Load time series CSV from S3, truncating to max_size_bytes while preserving order.
+            """Read to EOF and retain the newest unique timestamps per series.
 
-            When ``truncation_report`` is a dict:
-            - ``"cap_reached"`` is True only when the size limit stopped the read (including the
-              conservative case where accumulated rows hit exactly ``max_size_bytes``).
-            - ``"truncated"`` is True when the returned frame may be incomplete for any reason
-              (cap exhaustion or mid-stream read error with partial recovery).
-
-            When ``fail_on_partial_read`` is True, a mid-stream error is fatal. If no rows were
-            read, an empty dataframe is returned so the caller can report an empty test dataset.
+            A common row limit only decreases as series and maximum row costs are
+            discovered, so discarded history never needs to be recovered. Input
+            order does not affect the retained timestamp window. Partial reads fail.
+            Rows too large to fit alone leave timestamp markers; the final history
+            starts after the newest remaining marker, preserving a contiguous tail.
+            An oversized latest observation fails instead of returning older history.
+            ``fail_on_partial_read`` also permits an empty test frame for the caller.
             """
             from botocore.exceptions import SSLError
 
@@ -263,75 +270,129 @@ def timeseries_data_loader(
                 )
                 no_verify_client = get_s3_client(verify=False)
                 response = no_verify_client.get_object(Bucket=bucket_name, Key=file_key)
-            text_stream = io.TextIOWrapper(response["Body"], encoding="utf-8")
-
-            chunk_list = []
-            accumulated_size = 0
-            total_rows_read = 0
-
-            def _mark_cap_reached():
-                if truncation_report is not None:
-                    truncation_report["truncated"] = True
-                    truncation_report["cap_reached"] = True
-
-            def _mark_partial_read():
-                if truncation_report is not None:
-                    truncation_report["truncated"] = True
-
-            try:
-                for chunk_df in pd.read_csv(text_stream, chunksize=chunk_size):
-                    chunk_memory = chunk_df.memory_usage(deep=True).sum()
-
-                    if accumulated_size + chunk_memory > max_size_bytes:
-                        _mark_cap_reached()
-                        remaining_bytes = max_size_bytes - accumulated_size
-                        if remaining_bytes <= 0:
-                            break
-                        bytes_per_row = chunk_memory / len(chunk_df) if len(chunk_df) > 0 else 0
-                        if bytes_per_row > 0:
-                            rows_to_take = int(remaining_bytes / bytes_per_row)
-                            if rows_to_take > 0:
-                                chunk_df = chunk_df.head(rows_to_take)
-                                chunk_list.append(chunk_df)
-                                total_rows_read += len(chunk_df)
-                        break
-
-                    chunk_list.append(chunk_df)
-                    accumulated_size += chunk_memory
-                    total_rows_read += len(chunk_df)
-
-                    if accumulated_size >= max_size_bytes:
-                        _mark_cap_reached()
-                        break
-
-            except Exception as e:
-                if not chunk_list or fail_on_partial_read:
-                    raise ValueError(f"Error reading CSV from S3: {str(e)}") from e
-                logger.warning(
-                    "Partial CSV read from s3://%s/%s, keeping the %s row(s) read so far: %s",
-                    bucket_name,
-                    file_key,
-                    total_rows_read,
-                    e,
+            buffers, costs, source_stats = {}, {}, {}
+            row_limit, total_cost, total_rows_read = None, 0, 0
+            metadata_bytes = 0
+            sampled = False
+            columns = None
+            sampling_id = id_column or SYNTHETIC_ITEM_ID_COLUMN
+            inject_id = sampling_id == SYNTHETIC_ITEM_ID_COLUMN
+            with io.TextIOWrapper(response["Body"], encoding="utf-8") as text_stream:
+                try:
+                    for chunk_df in pd.read_csv(
+                        text_stream, chunksize=chunk_size, dtype=None if inject_id else {sampling_id: "string"}
+                    ):
+                        total_rows_read += len(chunk_df)
+                        if not len(chunk_df):
+                            continue
+                        columns = list(chunk_df.columns)
+                        required = {timestamp_column, target} | (set() if inject_id else {id_column})
+                        missing = required - set(columns)
+                        if missing:
+                            dataset = "test dataset" if fail_on_partial_read else "dataset"
+                            raise ValueError(f"Missing required columns in {dataset}: {missing}.")
+                        if inject_id:
+                            chunk_df[sampling_id] = SYNTHETIC_ITEM_ID_VALUE
+                        chunk_df = _clean_timeseries_dataframe(
+                            chunk_df, sampling_id, timestamp_column, logger, deduplicate=False
+                        )
+                        id_index = list(chunk_df.columns).index(sampling_id)
+                        ts_index = list(chunk_df.columns).index(timestamp_column)
+                        for row in chunk_df.itertuples(index=False, name=None):
+                            item_id, timestamp = str(row[id_index]), row[ts_index]
+                            cost = (
+                                192
+                                + sys.getsizeof(row)
+                                + sum(max(128, sys.getsizeof(value), sys.getsizeof(str(value))) for value in row)
+                            )
+                            oversized = cost > max_size_bytes - 132
+                            if oversized:
+                                # Keep only a timestamp marker; never hide a gap in the final tail.
+                                cost = 192 + sys.getsizeof(row) + 128 * len(row)
+                            if item_id not in buffers:
+                                metadata_bytes += 1024 + sys.getsizeof(item_id)
+                                if metadata_bytes > max_size_bytes:
+                                    raise ValueError("Series metadata exceeds the sampling budget; increase preset.")
+                                buffers[item_id] = ([], {})
+                                source_stats[item_id] = {
+                                    "source_rows_seen": 0,
+                                    "source_timestamp_min": timestamp,
+                                    "source_timestamp_max": timestamp,
+                                    "oversized_rows_seen": 0,
+                                }
+                            stats = source_stats[item_id]
+                            stats["source_rows_seen"] += 1
+                            stats["source_timestamp_min"] = min(stats["source_timestamp_min"], timestamp)
+                            stats["source_timestamp_max"] = max(stats["source_timestamp_max"], timestamp)
+                            stats["oversized_rows_seen"] += int(oversized)
+                            if cost > costs.get(item_id, 0):
+                                total_cost += cost - costs.get(item_id, 0)
+                                costs[item_id] = cost
+                                limit = (max_size_bytes - 132) // total_cost
+                                if limit < 1:
+                                    raise ValueError(
+                                        "Sampling budget cannot retain one row per series; increase preset."
+                                    )
+                                if row_limit is None or limit < row_limit:
+                                    row_limit = limit
+                                    for heap, rows in buffers.values():
+                                        while len(heap) > row_limit:
+                                            del rows[heapq.heappop(heap)]
+                                            sampled = True
+                            # Return the original columns for the existing ID injection
+                            # and cleansing paths. Preserve parsed time as the heap key.
+                            payload = None
+                            if not oversized:
+                                payload = list(row[: len(columns)])
+                                if hasattr(timestamp, "isoformat"):
+                                    payload[ts_index] = timestamp.isoformat()
+                            heap, rows = buffers[item_id]
+                            if timestamp in rows:
+                                rows[timestamp] = payload
+                            elif len(heap) < row_limit:
+                                heapq.heappush(heap, timestamp)
+                                rows[timestamp] = payload
+                            else:
+                                sampled = True
+                                if timestamp > heap[0]:
+                                    del rows[heapq.heapreplace(heap, timestamp)]
+                                    rows[timestamp] = payload
+                except Exception as e:
+                    raise ValueError(f"Error reading CSV from S3: {e}") from e
+            for heap, rows in buffers.values():
+                cutoff = max((timestamp for timestamp, payload in rows.items() if payload is None), default=None)
+                if cutoff is not None:
+                    while heap and heap[0] <= cutoff:
+                        del rows[heapq.heappop(heap)]
+                    sampled = True
+                    if not heap:
+                        raise ValueError(
+                            "Sampling budget cannot retain the latest observation of a series; increase preset."
+                        )
+            if truncation_report is not None:
+                truncation_report.update(
+                    truncated=sampled,
+                    cap_reached=sampled,
+                    source_rows_seen=total_rows_read,
+                    input_complete=True,
+                    source_series={
+                        item_id: {
+                            **stats,
+                            "source_timestamp_min": str(stats["source_timestamp_min"]),
+                            "source_timestamp_max": str(stats["source_timestamp_max"]),
+                        }
+                        for item_id, stats in source_stats.items()
+                    },
                 )
-                _mark_partial_read()
-
-            if not chunk_list:
+            if not buffers:
                 if fail_on_partial_read:
-                    # A header-only CSV yields no chunks at all, so the header is gone
-                    # too. Return an empty frame and let the caller report it as an
-                    # empty test dataset rather than as an inaccessible file.
                     return pd.DataFrame()
                 raise ValueError("No data was loaded from S3. The file may be empty or inaccessible.")
-
-            logger.debug(
-                "S3 chunk read: %s rows (~%.2f MiB)",
-                total_rows_read,
-                accumulated_size / (1024**2),
+            return pd.DataFrame(
+                [rows[timestamp] for _, rows in buffers.values() for timestamp in sorted(rows)], columns=columns
             )
-            return pd.concat(chunk_list, ignore_index=True)
 
-        def _clean_timeseries_dataframe(data, id_col, ts_col, log):
+        def _clean_timeseries_dataframe(data, id_col, ts_col, log, deduplicate=True):
             """Prepare panel data without dropping rows for missing targets (AutoGluon handles NaNs).
 
             Per time-series practice, **do not** drop rows for null/NaN targets or non-finite values
@@ -341,7 +402,8 @@ def timeseries_data_loader(
 
             This step: replace ``+/-inf`` with NaN; parse timestamps and **fail** if any are invalid;
             **fail** if any ``id_col`` or timestamp is null; ``drop_duplicates`` on ``(id_col, ts_col)``
-            (keep last) only for true duplicate keys.
+            (keep last) only for true duplicate keys. Sampling disables deduplication
+            to account for every source row before the timestamp buffers keep the last value.
             """
             rows_in = len(data)
             if rows_in == 0:
@@ -387,14 +449,18 @@ def timeseries_data_loader(
                         )
                 else:
                     # All nulls, let pd.to_datetime handle it
-                    out[ts_col] = pd.to_datetime(out[ts_col], errors="coerce", utc=True).dt.tz_localize(None)
+                    out[ts_col] = pd.to_datetime(out[ts_col], errors="coerce", utc=True, format="mixed").dt.tz_localize(
+                        None
+                    )
             else:
                 # Not all numeric - use standard datetime parsing.
                 # utc=True normalizes tz-aware strings (e.g. ISO 8601 with Z suffix) to UTC
                 # before tz_localize(None) strips timezone info, producing tz-naive datetime64[ns].
                 # This prevents pandas from writing tz-aware strings to CSV that AutoGluon
                 # cannot read back as datetime64 via TimeSeriesDataFrame.from_data_frame().
-                out[ts_col] = pd.to_datetime(out[ts_col], errors="coerce", utc=True).dt.tz_localize(None)
+                out[ts_col] = pd.to_datetime(out[ts_col], errors="coerce", utc=True, format="mixed").dt.tz_localize(
+                    None
+                )
 
             if out[id_col].isna().any():
                 raise ValueError(
@@ -409,12 +475,11 @@ def timeseries_data_loader(
                     "AutoGluon frequency inference (set TimeSeriesPredictor(freq=...) or regularize upstream)."
                 )
 
-            # Sort by (id, timestamp) BEFORE deduplication so that keep="last" means
-            # "keep the last row in chronological order" (after sorting), not "keep the last row in file order".
-            # This ensures we retain the chronologically latest observation for each (id, timestamp) pair.
-            out = out.sort_values(by=[id_col, ts_col])
+            # Keep the last occurrence in file order before sorting the unique keys.
             before_dedupe = len(out)
-            out = out.drop_duplicates(subset=[id_col, ts_col], keep="last")
+            if deduplicate:
+                out = out.drop_duplicates(subset=[id_col, ts_col], keep="last")
+                out = out.sort_values(by=[id_col, ts_col])
             dropped_dupes = before_dedupe - len(out)
             if dropped_dupes:
                 log.info(
@@ -520,8 +585,10 @@ def timeseries_data_loader(
                 "sampled_in_memory_bytes": int(df.memory_usage(deep=True).sum()),
                 "sample_cap_bytes": MAX_SIZE_BYTES,
                 "sample_cap_reached": bool(sampling_report.get("cap_reached")),
-                "sampling_method": "first_n_rows",
+                "sampling_method": "last_values_per_series",
                 "preset": preset,
+                "source_rows_seen": sampling_report["source_rows_seen"],
+                "input_complete": True,
             },
         )
         status.record("split_and_export", "started")
@@ -597,8 +664,20 @@ def timeseries_data_loader(
                 user_test_df[SYNTHETIC_ITEM_ID_COLUMN] = SYNTHETIC_ITEM_ID_VALUE
 
             if truncation_report.get("truncated"):
-                report_test_data_truncation(
-                    status, logger, test_data_source, len(user_test_df), TEST_DATA_MAX_SIZE_BYTES
+                logger.warning(
+                    "Test dataset %s was truncated to %s row(s), retaining the newest timestamps per series. "
+                    "Evaluation covers only these observations; see the component status sampling profile.",
+                    test_data_source,
+                    len(user_test_df),
+                )
+                status.record(
+                    "split_and_export",
+                    "running",
+                    metrics={
+                        "truncated": True,
+                        "test_rows": len(user_test_df),
+                        "max_size_bytes": TEST_DATA_MAX_SIZE_BYTES,
+                    },
                 )
 
             # Fail fast on covariates AutoGluon will demand at predict time, hours into the run.
@@ -774,7 +853,54 @@ def timeseries_data_loader(
         else:
             sample_rows = sample_tail.to_json(orient="records")
 
-        sample_config = {"sampling_method": "first_n_rows", "total_rows_loaded": len(df), "sampled_rows": len(df)}
+        def _series_profile(data, source_series=None):
+            """Record retained row counts and normalized time ranges without expanding the component API."""
+            return [
+                {
+                    "series_id": str(item_id),
+                    "rows": len(series),
+                    "timestamp_min": str(series[timestamp_column].min()),
+                    "timestamp_max": str(series[timestamp_column].max()),
+                    **(source_series or {}).get(str(item_id), {}),
+                }
+                for item_id, series in data.groupby(id_column, sort=False)
+            ]
+
+        profile = {
+            "sampling_method": "last_values_per_series",
+            "source_rows_seen": sampling_report["source_rows_seen"],
+            "input_complete": True,
+            "datasets": {
+                "retained": _series_profile(df, sampling_report["source_series"]),
+                "selection_train": _series_profile(selection_train_df),
+                "extra_train": _series_profile(extra_train_df),
+                "test": _series_profile(
+                    test_data_for_sample,
+                    truncation_report["source_series"] if has_user_test_data else sampling_report["source_series"],
+                ),
+            },
+        }
+        profile_name = "series_sampling_profile.json"
+        status_dir = Path(component_status.path)
+        status_dir.mkdir(parents=True, exist_ok=True)
+        (status_dir / profile_name).write_text(json.dumps(profile), encoding="utf-8")
+        status.set_metadata(
+            sampling_profile={
+                **profile,
+                "profile_file": profile_name,
+                "series_counts": {name: len(entries) for name, entries in profile["datasets"].items()},
+                "profiles_truncated": {
+                    name: len(entries) > MAX_SERIES_PROFILE for name, entries in profile["datasets"].items()
+                },
+                "datasets": {name: entries[:MAX_SERIES_PROFILE] for name, entries in profile["datasets"].items()},
+            }
+        )
+        sample_config = {
+            "sampling_method": "last_values_per_series",
+            "total_rows_loaded": len(df),
+            "sampled_rows": len(df),
+            "source_rows_seen": sampling_report["source_rows_seen"],
+        }
 
         logger.info(
             "Timeseries loader: %s rows from s3://%s/%s; split selection=%s extra=%s test=%s",
