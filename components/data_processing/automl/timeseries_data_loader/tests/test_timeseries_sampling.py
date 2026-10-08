@@ -396,6 +396,9 @@ def test_real_duplicate_values_keep_last_file_occurrence(real_pandas, tmp_path):
 
 def _run_real_component(pd, tmp_path, body, chunk_size):
     pytest.importorskip("pyarrow")
+    from pandas.io.parquet import get_engine
+
+    get_engine("pyarrow")
     read_csv = pd.read_csv
 
     def read_chunks(stream, **kwargs):
@@ -428,15 +431,69 @@ def _run_real_component(pd, tmp_path, body, chunk_size):
     )
 
 
-@pytest.mark.parametrize("years", [[2000, 2001], [2000.5, 2001.5]])
-def test_numeric_timestamp_report_is_json_serializable(real_pandas, years):
-    """Integer and fractional year bounds serialize as native JSON numbers."""
-    from kfp_components.components.training.automl.shared.timeseries_sampling import sample_timeseries_csv
-
+@pytest.mark.parametrize("first_year", [2000, 2000.5])
+@mock.patch.dict(os.environ, mocked_env_variables, clear=True)
+def test_numeric_timestamp_report_is_json_serializable(real_pandas, tmp_path, first_year):
+    """Numeric years survive production Parquet export and sampling profile serialization."""
+    years = [first_year + offset for offset in range(100)]
     body = "item_id,timestamp,target\n" + "\n".join(f"A,{year},1" for year in years)
-    _, report = sample_timeseries_csv(
-        io.StringIO(body), id_column="item_id", timestamp_column="timestamp", target="target", max_size_bytes=10000
-    )
-    decoded = json.loads(json.dumps(report))
-    assert decoded["per_series"][0]["retained"]["timestamp_min"] == years[0]
-    assert decoded["per_series"][0]["retained"]["timestamp_max"] == years[-1]
+    actual = _run_real_component(real_pandas, tmp_path, body, 17)
+    report = json.loads((tmp_path / "component_status" / "series_sampling_profile.json").read_text())
+    series = report["datasets"]["retained"][0]
+    assert actual["timestamp"].tolist() == years
+    assert series["rows"] == series["source_rows_seen"] == 100
+    assert float(series["timestamp_min"]) == float(series["source_timestamp_min"]) == years[0]
+    assert float(series["timestamp_max"]) == float(series["source_timestamp_max"]) == years[-1]
+
+
+def _variable_value_size(value, *args):
+    """Simulate different normal-row costs without allocating large CSV fields."""
+    if isinstance(value, str):
+        if value == "costly":
+            return 60 * 1024 * 1024
+        if value == "medium":
+            return 200_000
+    return _original_getsizeof(value, *args)
+
+
+@pytest.mark.parametrize("order", ["sorted", "reversed", "shuffled"])
+@pytest.mark.parametrize("chunk_size", [1, 17, 10000])
+@pytest.mark.parametrize("costly_series_length", [1, 300])
+@mock.patch.dict(os.environ, mocked_env_variables, clear=True)
+def test_heterogeneous_row_costs_preserve_cheaper_series_history(
+    real_pandas, tmp_path, order, chunk_size, costly_series_length
+):
+    """One costly normal row must not collapse every series to a single observation."""
+    rows = [f"A,{_date_from_day_offset(0)},0,costly"]
+    rows.extend(f"A,{_date_from_day_offset(day)},{day},small" for day in range(1, costly_series_length))
+    rows.extend(f"B,{_date_from_day_offset(day)},{day},medium" for day in range(300))
+    if order == "reversed":
+        rows.reverse()
+    elif order == "shuffled":
+        import random
+
+        random.Random(17).shuffle(rows)
+    body = "item_id,timestamp,target,feature\n" + "\n".join(rows)
+    with mock.patch.object(sys, "getsizeof", side_effect=_variable_value_size):
+        actual = _run_real_component(real_pandas, tmp_path, body, chunk_size)
+    assert set(actual["item_id"]) == {"A", "B"}
+    costly = actual[actual["item_id"] == "A"]
+    cheaper = actual[actual["item_id"] == "B"]
+    assert costly["target"].tolist() == [costly_series_length - 1]
+    assert 100 <= len(cheaper) < 300
+    assert cheaper["target"].tolist() == list(range(300 - len(cheaper), 300))
+    assert 60 * 1024 * 1024 + len(cheaper) * 200_000 <= 100 * 1024 * 1024
+    profile = json.loads((tmp_path / "component_status" / "series_sampling_profile.json").read_text())
+    assert all(series["oversized_rows_seen"] == 0 for series in profile["datasets"]["retained"])
+
+
+@mock.patch.dict(os.environ, mocked_env_variables, clear=True)
+def test_normal_row_costs_are_not_capped_per_series(real_pandas, tmp_path):
+    """Fail when even one uncapped normal row per series cannot fit the total budget."""
+    body = "item_id,timestamp,target,feature\n"
+    body += "\n".join(f"{item},{_date_from_day_offset(0)},0,costly" for item in ("A", "B"))
+    with (
+        mock.patch.object(sys, "getsizeof", side_effect=_variable_value_size),
+        pytest.raises(ValueError, match="cannot retain one row per series"),
+    ):
+        _run_real_component(real_pandas, tmp_path, body, 17)

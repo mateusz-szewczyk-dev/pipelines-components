@@ -249,8 +249,9 @@ def timeseries_data_loader(
         ):
             """Read to EOF and retain the newest unique timestamps per series.
 
-            A common row limit only decreases as series and maximum row costs are
-            discovered, so discarded history never needs to be recovered. Input
+            Reserve one row per series, then share the remaining bytes equally.
+            Each series' row limit uses its maximum row cost and only decreases as
+            more series or larger rows are discovered, so history need not be recovered. Input
             order does not affect the retained timestamp window. Partial reads fail.
             Rows too large to fit alone leave timestamp markers; the final history
             starts after the newest remaining marker, preserving a contiguous tail.
@@ -271,7 +272,8 @@ def timeseries_data_loader(
                 no_verify_client = get_s3_client(verify=False)
                 response = no_verify_client.get_object(Bucket=bucket_name, Key=file_key)
             buffers, costs, source_stats = {}, {}, {}
-            row_limit, total_cost, total_rows_read = None, 0, 0
+            total_cost, total_rows_read = 0, 0
+            extra_bytes_per_series, minimum_extra_bytes = 0, 0
             metadata_bytes = 0
             sampled = False
             columns = None
@@ -328,17 +330,24 @@ def timeseries_data_loader(
                             if cost > costs.get(item_id, 0):
                                 total_cost += cost - costs.get(item_id, 0)
                                 costs[item_id] = cost
-                                limit = (max_size_bytes - 132) // total_cost
-                                if limit < 1:
+                                remaining_bytes = max_size_bytes - 132 - total_cost
+                                if remaining_bytes < 0:
                                     raise ValueError(
                                         "Sampling budget cannot retain one row per series; increase preset."
                                     )
-                                if row_limit is None or limit < row_limit:
-                                    row_limit = limit
-                                    for heap, rows in buffers.values():
-                                        while len(heap) > row_limit:
+                                extra_bytes_per_series = remaining_bytes // len(costs)
+                                minimum_extra_bytes = max(minimum_extra_bytes, (len(buffers[item_id][0]) - 1) * cost)
+                                # Scan all buffers only when a retained history needs trimming.
+                                if extra_bytes_per_series < minimum_extra_bytes:
+                                    minimum_extra_bytes = 0
+                                    for series_id, (heap, rows) in buffers.items():
+                                        limit = 1 + extra_bytes_per_series // costs[series_id]
+                                        while len(heap) > limit:
                                             del rows[heapq.heappop(heap)]
                                             sampled = True
+                                        minimum_extra_bytes = max(
+                                            minimum_extra_bytes, (len(heap) - 1) * costs[series_id]
+                                        )
                             # Return the original columns for the existing ID injection
                             # and cleansing paths. Preserve parsed time as the heap key.
                             payload = None
@@ -347,6 +356,7 @@ def timeseries_data_loader(
                                 if hasattr(timestamp, "isoformat"):
                                     payload[ts_index] = timestamp.isoformat()
                             heap, rows = buffers[item_id]
+                            row_limit = 1 + extra_bytes_per_series // costs[item_id]
                             if timestamp in rows:
                                 rows[timestamp] = payload
                             elif len(heap) < row_limit:
@@ -357,6 +367,7 @@ def timeseries_data_loader(
                                 if timestamp > heap[0]:
                                     del rows[heapq.heapreplace(heap, timestamp)]
                                     rows[timestamp] = payload
+                            minimum_extra_bytes = max(minimum_extra_bytes, (len(heap) - 1) * costs[item_id])
                 except Exception as e:
                     raise ValueError(f"Error reading CSV from S3: {e}") from e
             for heap, rows in buffers.values():

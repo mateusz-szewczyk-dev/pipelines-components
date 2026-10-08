@@ -126,10 +126,13 @@ inputs are supported; retained rows are sorted before splitting. Conflicting `(i
 duplicates keep the last occurrence in file order. Invalid timestamps or incomplete reads fail
 instead of silently returning an old or partial history. External test CSVs use the same policy.
 
-A common row limit decreases as more series or larger rows are encountered. Conservative row
-costs include Python buffer overhead; short series can leave some budget unused. The CSV parser
-and exporting the retained frame require additional memory. A budget too small to retain even
-one observation per series fails explicitly.
+The sampler reserves one row per series, then shares the remaining byte budget equally.
+Each series has its own row limit based on its maximum observed row cost, so expensive rows
+do not force every series to retain the same small number of observations. Limits only decrease
+as more series or larger rows are encountered. Conservative row costs include Python buffer
+overhead; short series can leave some budget unused. The CSV parser and exporting the retained
+frame require additional memory. A budget too small to retain even one observation per series
+fails explicitly.
 
 An observation too large to fit alone is represented by a timestamp marker. After the complete
 read, history up to the newest remaining marker is removed, keeping a contiguous latest tail.
@@ -155,5 +158,6 @@ uv run python -m scripts.tests.run_component_tests \
 ```
 
 Tests cover per-series tails, input order, chunk boundaries, duplicates, oversized observations,
-full and bounded status profiles, external test sampling, and validation beyond the old head cutoff. Pandas/Parquet checks run
-when pandas and pyarrow are installed.
+different row costs across series, numeric timestamp profiles, full and bounded status profiles,
+external test sampling, and validation beyond the old head cutoff. Pandas/Parquet checks run when
+pandas and pyarrow are installed.
