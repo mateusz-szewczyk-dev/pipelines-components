@@ -1,7 +1,7 @@
 """Unit tests for the timeseries_data_loader component.
 
 boto3 and pandas are mocked via ``sys.modules`` so those packages are not required.
-Output CSVs are asserted with the stdlib :mod:`csv` module.
+Output CSVs are asserted with the stdlib :mod:`csv` module .
 """
 
 import csv
