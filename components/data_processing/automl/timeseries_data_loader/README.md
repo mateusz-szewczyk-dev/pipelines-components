@@ -135,9 +135,13 @@ This behavior is independent of chunk boundaries and input order.
 The sampler reserves one row per series, then shares the remaining byte budget equally.
 Each series has its own row limit based on its maximum observed row cost, so expensive rows
 do not force every series to retain the same small number of observations. Limits only decrease
-as more series or larger rows are encountered. Conservative row costs include Python buffer
-overhead; short series can leave some budget unused. The CSV parser and exporting the retained
-frame require additional memory. A budget too small to retain even one observation per series
+as more series or larger rows are encountered. Row costs account for stored Python values and
+buffer overhead, with a small reserve for numeric dtype changes and timestamp normalization.
+Per-series metadata also counts towards the budget; short series can leave some budget unused.
+The `prepare_data` metrics report `sampled_buffer_estimated_bytes` alongside
+`sampled_in_memory_bytes` (the final pandas frame), so the two memory representations can be
+compared. The CSV parser and exporting the retained frame require additional memory.
+A budget too small to retain even one observation per series
 fails explicitly.
 
 The selection-train split must contain at least one series with

@@ -118,8 +118,7 @@ def timeseries_data_loader(
         """Log the size of a dataframe: rows, columns, and in-memory bytes.
 
         ``memory_usage(deep=True)`` reports the pandas in-memory footprint, which
-        differs from the on-disk CSV size; it is the figure that matters for the
-        sampling budget and the pod memory limit.
+        differs from both the on-disk CSV size and the sampler's Python buffers.
         """
         try:
             n_rows = len(df)
@@ -356,7 +355,13 @@ def timeseries_data_loader(
                             cost = (
                                 192
                                 + sys.getsizeof(row)
-                                + sum(max(128, sys.getsizeof(value), sys.getsizeof(str(value))) for value in row)
+                                # Reserve datetime conversion space only for timestamps.
+                                # Other cells need only their stored size; 32 bytes covers
+                                # numeric dtype changes between CSV chunks.
+                                + sum(
+                                    max(128 if index == ts_index else 32, sys.getsizeof(value))
+                                    for index, value in enumerate(row)
+                                )
                             )
                             oversized = cost > max_size_bytes - 132
                             if oversized:
@@ -381,7 +386,7 @@ def timeseries_data_loader(
                             if cost > costs.get(item_id, 0):
                                 total_cost += cost - costs.get(item_id, 0)
                                 costs[item_id] = cost
-                                remaining_bytes = max_size_bytes - 132 - total_cost
+                                remaining_bytes = max_size_bytes - 132 - metadata_bytes - total_cost
                                 if remaining_bytes < 0:
                                     raise ValueError(
                                         "Sampling budget cannot retain one row per series; increase preset."
@@ -437,6 +442,9 @@ def timeseries_data_loader(
                     cap_reached=sampled,
                     source_rows_seen=total_rows_read,
                     input_complete=True,
+                    sampled_buffer_estimated_bytes=132
+                    + metadata_bytes
+                    + sum(len(rows) * costs[item_id] for item_id, (_, rows) in buffers.items()),
                     source_series={
                         item_id: {
                             **stats,
@@ -648,6 +656,7 @@ def timeseries_data_loader(
                 "rows": n_valid,
                 "sampled_rows": n_valid,
                 "sampled_in_memory_bytes": int(df.memory_usage(deep=True).sum()),
+                "sampled_buffer_estimated_bytes": sampling_report["sampled_buffer_estimated_bytes"],
                 "sample_cap_bytes": MAX_SIZE_BYTES,
                 "sample_cap_reached": bool(sampling_report.get("cap_reached")),
                 "sampling_method": "last_values_per_series",

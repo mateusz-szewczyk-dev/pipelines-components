@@ -516,6 +516,82 @@ def test_sampling_cannot_export_one_observation_per_series_for_training(tmp_path
     assert len(_read_csv_rows(artifact.path)) == 600
 
 
+@pytest.mark.parametrize("preset,series_count,length", [("speed", 500, 70), ("balanced", 4538, 30)])
+@mock.patch.dict(os.environ, mocked_env_variables, clear=True)
+def test_wide_numeric_panel_retains_trainable_history(real_pandas, tmp_path, preset, series_count, length):
+    """Real 115-column panels keep useful histories without artificial per-cell charges."""
+    pytest.importorskip("pyarrow")
+    from pandas.io.parquet import get_engine
+
+    get_engine("pyarrow")
+    pd = real_pandas
+    columns = ["item_id", "timestamp", "target"] + [f"feature_{i}" for i in range(112)]
+    features = ",".join(["0.5"] * 112)
+    body = (
+        ",".join(columns)
+        + "\n"
+        + "\n".join(
+            f"U{item:07d},{_date_from_day_offset(day)},{day},{features}"
+            for item in range(series_count)
+            for day in range(length)
+        )
+    )
+    artifact = _make_test_artifact(tmp_path)
+    with _mock_boto3_module(get_object_return={"Body": io.BytesIO(body.encode())}):
+        result = timeseries_data_loader.python_func(
+            file_key="wide_panel.csv",
+            bucket_name="b",
+            workspace_path=str(tmp_path),
+            target="target",
+            timestamp_column="timestamp",
+            id_column="item_id",
+            preset=preset,
+            sampled_test_dataset=artifact,
+        )
+    selection = pd.read_parquet(result.models_selection_train_data_path)
+    assert list(selection.columns) == columns
+    assert selection.groupby("item_id").size().min() >= 6
+    assert selection["item_id"].nunique() == series_count
+    retained = pd.concat([selection, pd.read_parquet(result.extra_train_data_path), pd.read_parquet(artifact.path)])
+    assert retained.memory_usage(deep=True).sum() <= {"speed": 100 * 1024**2, "balanced": 1024**3}[preset]
+    for _, series in retained.groupby("item_id", sort=False):
+        days = sorted(series["target"].tolist())
+        assert days == list(range(length - len(days), length))
+    assert result.sample_config["source_rows_seen"] == series_count * length
+    status = json.loads((tmp_path / "component_status" / "component_status.json").read_text())
+    prepare = next(stage for stage in status["stages"] if stage["id"] == "prepare_data")
+    assert prepare["metrics"]["sampled_buffer_estimated_bytes"] <= prepare["metrics"]["sample_cap_bytes"]
+    if preset == "speed":
+        assert result.sample_config["sampled_rows"] < series_count * length
+    else:
+        assert result.sample_config["sampled_rows"] == series_count * length
+
+
+@mock.patch.dict(os.environ, mocked_env_variables, clear=True)
+def test_numeric_dtype_changes_do_not_change_sample_window(real_pandas, tmp_path):
+    """Integer/float inference across chunks must not change the retained histories."""
+    columns = ["item_id", "timestamp", "target", "feature"] + [f"numeric_{i}" for i in range(111)]
+    body = (
+        ",".join(columns)
+        + "\n"
+        + "\n".join(
+            f"{item},{_date_from_day_offset(day)},{day},medium," + ",".join(["0.5" if day == 0 else "0"] * 111)
+            for item in ("A", "B")
+            for day in range(300)
+        )
+    )
+    results = []
+    for chunk_size in (17, 10000):
+        workspace = tmp_path / str(chunk_size)
+        workspace.mkdir()
+        with mock.patch.object(sys, "getsizeof", side_effect=_variable_value_size):
+            results.append(_run_real_component(real_pandas, workspace, body, chunk_size))
+    real_pandas.testing.assert_frame_equal(*results)
+    assert 100 <= len(results[0]) < 600
+    for _, series in results[0].groupby("item_id"):
+        assert series["target"].tolist() == list(range(300 - len(series), 300))
+
+
 @mock.patch.dict(os.environ, mocked_env_variables, clear=True)
 def test_selection_history_validation_uses_prediction_length(tmp_path):
     """A nonempty selection split still needs enough history for the forecast horizon."""
