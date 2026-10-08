@@ -62,6 +62,9 @@ def timeseries_data_loader(
     After cleansing, at least **100** valid records must remain; otherwise the component
     fails with a clear error so downstream AutoGluon training does not run on datasets too
     small to split reliably.
+    At least one selection-train series must also have
+    ``max(prediction_length + 1, 5) + prediction_length`` observations for AutoGluon's
+    default internal validation.
 
     Args:
         file_key: S3 object key of the CSV file containing time series data.
@@ -75,8 +78,9 @@ def timeseries_data_loader(
         sampled_test_dataset: Output dataset artifact for the test split.
         component_status: Output artifact containing stage-level progress tracking for this component.
         selection_train_size: Fraction of train portion for model selection (default: 0.3).
-        prediction_length: Forecast horizon used downstream (default: 1). Only used to
-            fail fast when a user-provided test series is too short to be evaluated.
+        prediction_length: Forecast horizon used downstream (default: 1). Validates that
+            selection-train contains a series long enough for training and that user-provided
+            test series are long enough to be evaluated.
         known_covariates_names: Covariate columns known in advance downstream (default: none).
             Only used to fail fast when a user-provided test dataset omits one of them.
         test_data_bucket_name: S3 bucket name for user-provided test dataset (default: empty string).
@@ -91,7 +95,8 @@ def timeseries_data_loader(
             ``test_data_*`` pair is set or the test key is not a valid S3 object key, if the
             test dataset is empty, missing required or covariate columns, shares no series
             with the training data, or has a series shorter than ``prediction_length``, or if
-            fewer than 100 valid records remain after cleansing.
+            fewer than 100 valid records remain after cleansing, or no selection-train
+            series is long enough for AutoGluon's default internal validation.
 
     Returns:
         NamedTuple: sample_config, split_config, sample_rows, models_selection_train_data_path,
@@ -239,6 +244,23 @@ def timeseries_data_loader(
                 verify=verify,
             )
 
+        def _year_as_iso(value):
+            """Convert year tokens to calendar dates, leaving other date formats for pandas."""
+            try:
+                year = float(value)
+            except (TypeError, ValueError):
+                return value
+            if year != year:  # Preserve NaN for the existing invalid-timestamp check.
+                return value
+            if not 1800 <= year <= 2200:
+                raise ValueError(
+                    f"Column {timestamp_column!r} contains numeric values outside the fractional year range "
+                    "(1800-2200). If these are Unix timestamps, convert them to ISO date strings upstream."
+                )
+            start = pd.Timestamp(year=int(year), month=1, day=1)
+            end = pd.Timestamp(year=int(year) + 1, month=1, day=1)
+            return (start + (end - start) * (year - int(year))).isoformat()
+
         def load_timeseries_data_truncate(
             bucket_name,
             file_key,
@@ -256,6 +278,8 @@ def timeseries_data_loader(
             Rows too large to fit alone leave timestamp markers; the final history
             starts after the newest remaining marker, preserving a contiguous tail.
             An oversized latest observation fails instead of returning older history.
+            Numeric-only time axes stay numeric. Encountering a date switches all
+            timestamp keys and source ranges to datetimes for the rest of the CSV.
             ``fail_on_partial_read`` also permits an empty test frame for the caller.
             """
             from botocore.exceptions import SSLError
@@ -276,6 +300,7 @@ def timeseries_data_loader(
             extra_bytes_per_series, minimum_extra_bytes = 0, 0
             metadata_bytes = 0
             sampled = False
+            datetime_timestamps = False
             columns = None
             sampling_id = id_column or SYNTHETIC_ITEM_ID_COLUMN
             inject_id = sampling_id == SYNTHETIC_ITEM_ID_COLUMN
@@ -295,8 +320,34 @@ def timeseries_data_loader(
                             raise ValueError(f"Missing required columns in {dataset}: {missing}.")
                         if inject_id:
                             chunk_df[sampling_id] = SYNTHETIC_ITEM_ID_VALUE
+                        if (
+                            not datetime_timestamps
+                            and not pd.to_numeric(chunk_df[timestamp_column], errors="coerce").notna().all()
+                        ):
+                            datetime_timestamps = True
+                            # Convert earlier numeric history once, including oversized markers.
+                            for heap, rows in buffers.values():
+                                converted = {}
+                                for timestamp, payload in rows.items():
+                                    timestamp = pd.to_datetime(_year_as_iso(timestamp), utc=True).tz_localize(None)
+                                    if payload is not None:
+                                        payload[columns.index(timestamp_column)] = timestamp.isoformat()
+                                    converted[timestamp] = payload
+                                heap[:] = sorted(converted)
+                                rows.clear()
+                                rows.update(converted)
+                            for stats in source_stats.values():
+                                for bound in ("source_timestamp_min", "source_timestamp_max"):
+                                    stats[bound] = pd.to_datetime(_year_as_iso(stats[bound]), utc=True).tz_localize(
+                                        None
+                                    )
                         chunk_df = _clean_timeseries_dataframe(
-                            chunk_df, sampling_id, timestamp_column, logger, deduplicate=False
+                            chunk_df,
+                            sampling_id,
+                            timestamp_column,
+                            logger,
+                            deduplicate=False,
+                            normalize_years=datetime_timestamps,
                         )
                         id_index = list(chunk_df.columns).index(sampling_id)
                         ts_index = list(chunk_df.columns).index(timestamp_column)
@@ -403,7 +454,7 @@ def timeseries_data_loader(
                 [rows[timestamp] for _, rows in buffers.values() for timestamp in sorted(rows)], columns=columns
             )
 
-        def _clean_timeseries_dataframe(data, id_col, ts_col, log, deduplicate=True):
+        def _clean_timeseries_dataframe(data, id_col, ts_col, log, deduplicate=True, normalize_years=False):
             """Prepare panel data without dropping rows for missing targets (AutoGluon handles NaNs).
 
             Per time-series practice, **do not** drop rows for null/NaN targets or non-finite values
@@ -428,6 +479,9 @@ def timeseries_data_loader(
 
             # Check if all non-null timestamps are numeric
             is_numeric = pd.to_numeric(non_null_ts, errors="coerce").notna().all() if len(non_null_ts) > 0 else False
+            if normalize_years and pd.to_numeric(non_null_ts, errors="coerce").notna().any():
+                out[ts_col] = ts_series.map(_year_as_iso)
+                is_numeric = False
 
             if is_numeric:
                 # Convert to numeric
@@ -822,6 +876,18 @@ def timeseries_data_loader(
                 "test_size": test_size,
                 "selection_train_size": selection_train_size,
             }
+
+        minimum_selection_rows = max(prediction_length + 1, 5) + prediction_length
+        longest_selection_series = max(
+            (len(series) for _, series in selection_train_df.groupby(id_column, sort=False)), default=0
+        )
+        if longest_selection_series < minimum_selection_rows:
+            raise ValueError(
+                f"Selection-train has no series with at least {minimum_selection_rows} observations required "
+                f"for prediction_length={prediction_length} and AutoGluon's internal validation; "
+                f"the longest has {longest_selection_series}. Increase preset to retain more history, "
+                "increase selection_train_size, or provide longer series."
+            )
 
         _log_dataset_stats("split: selection_train", selection_train_df)
         _log_dataset_stats("split: extra_train", extra_train_df)

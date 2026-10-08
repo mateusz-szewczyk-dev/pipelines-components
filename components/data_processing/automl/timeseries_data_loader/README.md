@@ -16,7 +16,8 @@ The test set is written to an S3 artifact, while train Parquet files (selection-
 Unsorted input is supported: timestamps are validated before sampling and retained rows are sorted before splitting. Partial CSV reads fail. The existing component_status artifact records source and retained counts and time ranges in series_sampling_profile.json, with a summary of up to 50 series
 per dataset under metadata.sampling_profile.
 
-After cleansing, at least **100** valid records must remain; otherwise the component fails with a clear error so downstream AutoGluon training does not run on datasets too small to split reliably.
+After cleansing, at least **100** valid records must remain; otherwise the component fails with a clear error so downstream AutoGluon training does not run on datasets too small to split reliably. At least one selection-train series must also have ``max(prediction_length + 1, 5) +
+prediction_length`` observations for AutoGluon's default internal validation.
 
 ## Inputs 📥
 
@@ -31,7 +32,7 @@ After cleansing, at least **100** valid records must remain; otherwise the compo
 | `component_status` | `dsl.Output[dsl.Artifact]` | `None` | Output artifact containing stage-level progress tracking for this component. |
 | `id_column` | `str` | `""` | Name of the column identifying each time series (item_id). Pass an empty string ("") for single-series two-column datasets (timestamp + target only); the loader will inject a synthetic ID column (__synthetic_item_id) with value "item_0". |
 | `selection_train_size` | `float` | `0.3` | Fraction of train portion for model selection (default: 0.3). |
-| `prediction_length` | `int` | `1` | Forecast horizon used downstream (default: 1). Only used to fail fast when a user-provided test series is too short to be evaluated. |
+| `prediction_length` | `int` | `1` | Forecast horizon used downstream (default: 1). Validates that selection-train contains a series long enough for training and that user-provided test series are long enough to be evaluated. |
 | `known_covariates_names` | `Optional[List[str]]` | `None` | Covariate columns known in advance downstream (default: none). Only used to fail fast when a user-provided test dataset omits one of them. |
 | `test_data_bucket_name` | `str` | `""` | S3 bucket name for user-provided test dataset (default: empty string). |
 | `test_data_file_key` | `str` | `""` | S3 object key of the user-provided test CSV (default: empty string). |
@@ -126,6 +127,11 @@ inputs are supported; retained rows are sorted before splitting. Conflicting `(i
 duplicates keep the last occurrence in file order. Invalid timestamps or incomplete reads fail
 instead of silently returning an old or partial history. External test CSVs use the same policy.
 
+Numeric-only year axes remain numeric. When a CSV mixes years and date strings, all timestamps
+are normalized to dates, including previously buffered rows and source ranges. An integer year
+means January 1; a fractional year represents the elapsed fraction of that calendar year.
+This behavior is independent of chunk boundaries and input order.
+
 The sampler reserves one row per series, then shares the remaining byte budget equally.
 Each series has its own row limit based on its maximum observed row cost, so expensive rows
 do not force every series to retain the same small number of observations. Limits only decrease
@@ -133,6 +139,13 @@ as more series or larger rows are encountered. Conservative row costs include Py
 overhead; short series can leave some budget unused. The CSV parser and exporting the retained
 frame require additional memory. A budget too small to retain even one observation per series
 fails explicitly.
+
+The selection-train split must contain at least one series with
+`max(prediction_length + 1, 5) + prediction_length` observations for AutoGluon's default internal
+validation. With the default horizon and split fractions, this requires at least 25 retained
+observations in that series. The loader fails early if sampling or splitting leaves every series
+too short, even when the total dataset exceeds 100 rows. Increase the sampling preset, increase
+`selection_train_size`, or provide longer histories.
 
 An observation too large to fit alone is represented by a timestamp marker. After the complete
 read, history up to the newest remaining marker is removed, keeping a contiguous latest tail.

@@ -247,7 +247,7 @@ def test_duplicate_cost_is_independent_of_chunk_boundary(real_pandas, tmp_path):
 @mock.patch.dict(os.environ, mocked_env_variables, clear=True)
 def test_full_profile_preserves_all_series_and_actual_unique_counts(tmp_path):
     """A bounded status summary points to full, post-dedup counts and source ranges."""
-    rows = [f"S{item:03d},{_date_from_day_offset(day)},{day},0" for item in range(60) for day in (0, 1, 2, 2)]
+    rows = [f"S{item:03d},{_date_from_day_offset(day)},{day},0" for item in range(60) for day in (*range(25), 24)]
     artifact = _make_test_artifact(tmp_path)
     with _mock_boto3_and_pandas(
         get_object_return={"Body": io.BytesIO(("item_id,timestamp,target,feature\n" + "\n".join(rows)).encode())}
@@ -264,18 +264,18 @@ def test_full_profile_preserves_all_series_and_actual_unique_counts(tmp_path):
     status_dir = tmp_path / "component_status"
     summary = json.loads((status_dir / "component_status.json").read_text())["metadata"]["sampling_profile"]
     full = json.loads((status_dir / summary["profile_file"]).read_text())
-    assert result.sample_config["sampled_rows"] == 180
-    assert full["source_rows_seen"] == 240
+    assert result.sample_config["sampled_rows"] == 1500
+    assert full["source_rows_seen"] == 1560
     assert full["input_complete"] is True
     for name, entries in full["datasets"].items():
         assert len(entries) == summary["series_counts"][name] == 60
         assert len(summary["datasets"][name]) == 50
         assert summary["profiles_truncated"][name] is True
     for series in full["datasets"]["retained"]:
-        assert series["rows"] == 3
-        assert series["source_rows_seen"] == 4
+        assert series["rows"] == 25
+        assert series["source_rows_seen"] == 26
         assert series["source_timestamp_min"] == _date_from_day_offset(0)
-        assert series["source_timestamp_max"] == _date_from_day_offset(2)
+        assert series["source_timestamp_max"] == _date_from_day_offset(24)
 
 
 def _oversized_value_size(value, *args):
@@ -432,18 +432,107 @@ def _run_real_component(pd, tmp_path, body, chunk_size):
 
 
 @pytest.mark.parametrize("first_year", [2000, 2000.5])
+@pytest.mark.parametrize("chunk_size", [1, 17, 10000])
 @mock.patch.dict(os.environ, mocked_env_variables, clear=True)
-def test_numeric_timestamp_report_is_json_serializable(real_pandas, tmp_path, first_year):
+def test_numeric_timestamp_report_is_json_serializable(real_pandas, tmp_path, first_year, chunk_size):
     """Numeric years survive production Parquet export and sampling profile serialization."""
     years = [first_year + offset for offset in range(100)]
     body = "item_id,timestamp,target\n" + "\n".join(f"A,{year},1" for year in years)
-    actual = _run_real_component(real_pandas, tmp_path, body, 17)
+    actual = _run_real_component(real_pandas, tmp_path, body, chunk_size)
     report = json.loads((tmp_path / "component_status" / "series_sampling_profile.json").read_text())
     series = report["datasets"]["retained"][0]
     assert actual["timestamp"].tolist() == years
     assert series["rows"] == series["source_rows_seen"] == 100
     assert float(series["timestamp_min"]) == float(series["source_timestamp_min"]) == years[0]
     assert float(series["timestamp_max"]) == float(series["source_timestamp_max"]) == years[-1]
+
+
+@pytest.mark.parametrize("year_token,year_date", [("2000", "2000-01-01"), ("2000.5", "2000-07-02")])
+@pytest.mark.parametrize("order", ["years_first", "dates_first", "shuffled"])
+@mock.patch.dict(os.environ, mocked_env_variables, clear=True)
+def test_mixed_year_and_iso_timestamps_are_independent_of_chunk_size(
+    real_pandas, tmp_path, year_token, year_date, order
+):
+    """Normalize mixed years before comparisons, including already-capped numeric buffers."""
+    import random
+
+    pd = real_pandas
+    rows = [("A", year_token, 999)] + [
+        ("A", date.date().isoformat(), day)
+        for day, date in enumerate(pd.date_range("2000-01-02", periods=300), start=1)
+    ]
+    if order == "dates_first":
+        rows = rows[1:] + rows[:1]
+    elif order == "shuffled":
+        random.Random(17).shuffle(rows)
+    body = "item_id,timestamp,target\n" + "\n".join(",".join(map(str, row)) for row in rows)
+    expected = pd.DataFrame(rows, columns=["item_id", "timestamp", "target"])
+    expected["timestamp"] = pd.to_datetime(expected["timestamp"].replace({year_token: year_date}))
+    expected = expected.drop_duplicates(["item_id", "timestamp"], keep="last").sort_values("timestamp")
+    itertuples = pd.DataFrame.itertuples
+
+    class SizedTuple(tuple):
+        def __sizeof__(self):
+            return 500_000
+
+    def sized_rows(frame, **kwargs):
+        return (SizedTuple(row) for row in itertuples(frame, **kwargs))
+
+    results, profiles = [], []
+    for chunk_size in (1, 17, 10000):
+        workspace = tmp_path / str(chunk_size)
+        workspace.mkdir()
+        with mock.patch.object(pd.DataFrame, "itertuples", sized_rows):
+            actual = _run_real_component(pd, workspace, body, chunk_size)
+        assert 100 <= len(actual) < len(expected)
+        pd.testing.assert_frame_equal(actual, expected.tail(len(actual)).reset_index(drop=True))
+        results.append(actual)
+        profiles.append(json.loads((tmp_path / "component_status" / "series_sampling_profile.json").read_text()))
+    for result in results[1:]:
+        pd.testing.assert_frame_equal(results[0], result)
+    assert profiles[0] == profiles[1] == profiles[2]
+    series = profiles[0]["datasets"]["retained"][0]
+    assert series["source_rows_seen"] == len(rows)
+    assert series["source_timestamp_min"] == str(expected["timestamp"].min())
+    assert series["source_timestamp_max"] == str(expected["timestamp"].max())
+
+
+@mock.patch.dict(os.environ, mocked_env_variables, clear=True)
+def test_sampling_cannot_export_one_observation_per_series_for_training(tmp_path):
+    """A large panel must fail in the loader when the budget erases usable history."""
+    from .test_component_unit import _run_loader
+
+    body = "item_id,timestamp,target,feature\n" + "\n".join(
+        f"U{item:03d},{_date_from_day_offset(day)},{day},0" for item in range(100) for day in range(30)
+    )
+    with mock.patch.object(MockedDataFrame, "BYTES_PER_ROW", 800_000):
+        with pytest.raises(ValueError, match=r"at least 6 observations.*the longest has 1.*Increase preset"):
+            _run_loader(tmp_path, body)
+        assert not (tmp_path / "datasets" / "models_selection_train_dataset.parquet").exists()
+        result, artifact = _run_loader(tmp_path, body, preset="quality")
+    selection = _read_csv_rows(result.models_selection_train_data_path)
+    assert result.sample_config["sampled_rows"] == 3000
+    assert len(selection) == 700
+    assert len(_read_csv_rows(artifact.path)) == 600
+
+
+@mock.patch.dict(os.environ, mocked_env_variables, clear=True)
+def test_selection_history_validation_uses_prediction_length(tmp_path):
+    """A nonempty selection split still needs enough history for the forecast horizon."""
+    with (
+        _mock_boto3_and_pandas(get_object_return={"Body": io.BytesIO(_panel_csv(100).encode())}),
+        pytest.raises(ValueError, match=r"at least 41 observations.*prediction_length=20"),
+    ):
+        timeseries_data_loader.python_func(
+            file_key="panel.csv",
+            bucket_name="b",
+            workspace_path=str(tmp_path),
+            target="target",
+            timestamp_column="timestamp",
+            id_column="item_id",
+            prediction_length=20,
+            sampled_test_dataset=_make_test_artifact(tmp_path),
+        )
 
 
 def _variable_value_size(value, *args):
