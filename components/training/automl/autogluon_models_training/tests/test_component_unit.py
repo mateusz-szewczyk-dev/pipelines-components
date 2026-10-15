@@ -1,6 +1,8 @@
 """Unit tests for the autogluon_models_training component."""
 
+import ast
 import json
+import os
 import sys
 import threading
 from contextlib import contextmanager
@@ -264,6 +266,57 @@ _DEFAULT_EXPERIMENT_NOTEBOOK_ARTIFACT = _make_experiment_notebook_artifact(Path(
 
 class TestAutogluonModelsTrainingUnitTests:
     """Unit tests for the autogluon_models_training component."""
+
+    @pytest.mark.parametrize(
+        "template_name",
+        ["classification_notebook.ipynb", "regression_notebook.ipynb", "timeseries_notebook.ipynb"],
+    )
+    @pytest.mark.parametrize(
+        ("ca_bundle", "retry_fails"),
+        [
+            (None, False),
+            ("", False),
+            (" \t", False),
+            ("/test/ca.pem", False),
+            (" /test/ca.pem ", False),
+            ("/test/ca.pem", True),
+        ],
+    )
+    def test_notebook_template_tls_failure_keeps_verification_enabled(
+        self, template_name, ca_bundle, retry_fails, monkeypatch
+    ):
+        """TLS failures either stop the download or retry once with an explicit CA bundle."""
+        notebook = json.loads((_NOTEBOOK_TEMPLATES_DIR / template_name).read_text(encoding="utf-8"))
+        source = next(
+            "".join(cell["source"])
+            for cell in notebook["cells"]
+            if "def _download_model(" in "".join(cell.get("source", []))
+        )
+        retry = next(node for node in ast.parse(source).body if isinstance(node, ast.Try))
+        tls_error_class = type("SSLError", (Exception,), {})
+        tls_error = tls_error_class("TLS verification failed")
+        retry_result = tls_error_class("Invalid CA bundle") if retry_fails else "run/model"
+        download = mock.Mock(side_effect=[tls_error, retry_result])
+        namespace = {"os": os, "SSLError": tls_error_class, "_download_model": download}
+        if ca_bundle is None:
+            monkeypatch.delenv("AWS_CA_BUNDLE", raising=False)
+        else:
+            monkeypatch.setenv("AWS_CA_BUNDLE", ca_bundle)
+
+        code = compile(ast.Module(body=[retry], type_ignores=[]), template_name, "exec")
+        if not ca_bundle or not ca_bundle.strip():
+            with pytest.raises(RuntimeError, match="AWS_CA_BUNDLE") as raised:
+                exec(code, namespace)
+            assert raised.value.__cause__ is tls_error
+            download.assert_called_once_with()
+        else:
+            if retry_fails:
+                with pytest.raises(tls_error_class, match="Invalid CA bundle"):
+                    exec(code, namespace)
+            else:
+                exec(code, namespace)
+                assert namespace["best_model_path"] == "run/model"
+            assert download.call_args_list == [mock.call(), mock.call(verify=ca_bundle.strip())]
 
     @pytest.mark.parametrize(
         "template_name",
