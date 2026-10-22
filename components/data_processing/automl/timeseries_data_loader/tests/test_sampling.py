@@ -8,10 +8,30 @@ import pytest
 from kfp_components.components.training.automl.shared import timeseries_sampling as sampling
 
 
+@pytest.fixture(autouse=True)
+def python_string_storage():
+    """Keep fixture and Parquet-read storage equal for exact byte/count assertions.
+
+    Parquet retains the logical string dtype but not pandas' storage backend.
+    Loader integration tests separately exercise the environment's default storage.
+    """
+    with pd.option_context("mode.string_storage", "python"):
+        yield
+
+
 def _panel(lengths):
     frames = []
     for series, n in lengths.items():
-        frames.append(pd.DataFrame({"id": series, "time": pd.date_range("2020-01-01", periods=n), "target": range(n)}))
+        frames.append(
+            pd.DataFrame(
+                {
+                    # Preserve the same storage through Parquet, regardless of pandas' inference defaults.
+                    "id": pd.Series([series] * n, dtype=pd.StringDtype(storage="python")),
+                    "time": pd.date_range("2020-01-01", periods=n),
+                    "target": range(n),
+                }
+            )
+        )
     return pd.concat(frames, ignore_index=True)
 
 
@@ -129,8 +149,10 @@ def test_dtype_promotion_after_spill_still_obeys_pandas_budget(tmp_path):
 
 def test_budget_cannot_shorten_history_below_minimum(tmp_path):
     """The sampler fails instead of silently dropping IDs or unusably truncating them."""
+    frame = _panel({"A": 100, "B": 100})
+    budget = int(frame.head(20).reset_index(drop=True).memory_usage(deep=True).sum())
     with pytest.raises(ValueError, match="sufficient history"):
-        _run(tmp_path, _panel({"A": 100, "B": 100}), 132 + 20 * 74, minimum=30)
+        _run(tmp_path, frame, budget, minimum=30)
     assert not list(tmp_path.glob("timeseries-sampling-*"))
 
 

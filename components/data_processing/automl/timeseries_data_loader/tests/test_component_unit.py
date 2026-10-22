@@ -385,12 +385,22 @@ class TestTimeseriesDataLoaderUnitTests:
     @mock.patch.dict(os.environ, mocked_env_variables, clear=True)
     def test_sample_cap_reached_with_full_source_scan(self, tmp_path):
         """A small sample budget does not prevent scanning the newest observations."""
-        body_stream = io.BytesIO(_timeseries_csv(n_rows=300).encode("utf-8"))
+        source = pd.DataFrame(
+            {
+                "item_id": "series-1",
+                "timestamp": pd.date_range("2024-01-01", periods=3000),
+                "target": range(3000),
+                "feature": range(3000),
+            }
+        )
+        body_stream = io.BytesIO(source.to_csv(index=False).encode("utf-8"))
         sampled_test = _make_test_artifact(tmp_path)
         component_status = mock.MagicMock()
         component_status.path = str(tmp_path / "component_status")
         component_status.metadata = {}
 
+        # The two numeric columns alone exceed this budget (3000 * 2 * 8 bytes),
+        # even when pandas stores the string column in a compact Arrow array.
         with mock.patch.dict(sampling.PRESET_MAX_SIZE_BYTES, {"speed": 15_000}):
             with _mock_boto3_and_pandas(get_object_return={"Body": body_stream}):
                 timeseries_data_loader.python_func(
@@ -407,7 +417,7 @@ class TestTimeseriesDataLoaderUnitTests:
         payload = json.loads((Path(component_status.path) / "component_status.json").read_text())
         stages = {stage["id"]: stage for stage in payload["stages"]}
         assert stages["prepare_data"]["metrics"]["sample_cap_reached"] is True
-        assert stages["prepare_data"]["metrics"]["scanned_rows"] == 300
+        assert stages["prepare_data"]["metrics"]["scanned_rows"] == 3000
 
     @mock.patch.dict(os.environ, mocked_env_variables, clear=True)
     def test_no_data_rows_raises(self, tmp_path):
