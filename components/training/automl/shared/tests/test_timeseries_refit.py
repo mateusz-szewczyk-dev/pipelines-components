@@ -66,6 +66,9 @@ def sdk(monkeypatch, tmp_path):
         model_path = Path(path) / "models" / name
         model_path.mkdir(parents=True)
         (model_path / "weights.bin").write_bytes(name.encode())
+        data_path = Path(path) / "utils" / "data"
+        data_path.mkdir(parents=True)
+        (data_path / "train.pkl").write_bytes(b"full refit frame")
         fitted_model = mock.MagicMock(name=name)
         fitted_model.path = str(model_path)
         refit._trainer.load_model.return_value = fitted_model
@@ -113,6 +116,7 @@ def test_single_member_ensemble_and_standalone_train_only_once(sdk, tmp_path):
     assert plan.refit_records[0]["model"] == tft.name
     assert plan.refit_records[0]["status"] == "completed"
     assert plan.refit_records[0]["elapsed_seconds"] >= 0
+    assert not (Path(sdk.created[0].path) / "utils" / "data" / "train.pkl").exists()
 
     plan.export(ensemble.name, tmp_path / "export")
     trainer = sdk.exported._trainer
@@ -124,6 +128,7 @@ def test_single_member_ensemble_and_standalone_train_only_once(sdk, tmp_path):
     trainer.save.assert_called_once()
     sdk.exported.save.assert_called_once()
     assert (tmp_path / "export" / "models" / tft.name / "weights.bin").exists()
+    assert not (tmp_path / "export" / "utils" / "data" / "train.pkl").exists()
     assert plan.metadata(ensemble.name) == {
         "prediction_model": ensemble.name,
         "refit_base_models": [tft.name],
@@ -143,6 +148,7 @@ def test_multi_member_same_family_preserves_configs_weights_and_assets(sdk, tmp_
     original_weights = copy.deepcopy(ensemble.model_to_weight)
     for name in [ensemble.name, second.name, first.name]:
         plan.fit_base_models(name, object(), tmp_path / "cache", {})
+        assert not list((tmp_path / "cache").rglob("train.pkl"))
     assert len(sdk.created) == 2
     assert plan.time_limit_per_model == 300
     for refit, model in zip(sdk.created, [first, second], strict=True):
@@ -156,6 +162,7 @@ def test_multi_member_same_family_preserves_configs_weights_and_assets(sdk, tmp_
     assert trainer._add_model.call_args.kwargs["base_models"] == [first.name, second.name]
     assert (tmp_path / "export" / "models" / second.name / "weights.bin").read_bytes() == second.name.encode()
     assert plan.metadata(ensemble.name)["refit_base_models"] == [first.name, second.name]
+    assert not list((tmp_path / "export").rglob("train.pkl"))
 
 
 def test_failed_shared_dependency_is_not_retrained(sdk, tmp_path):
@@ -178,6 +185,42 @@ def test_failed_shared_dependency_is_not_retrained(sdk, tmp_path):
     assert len(sdk.created) == 1
     assert plan.refit_records[0]["status"] == "failed"
     assert plan.refit_records[0]["elapsed_seconds"] >= 0
+    assert not (Path(sdk.created[0].path) / "utils" / "data" / "train.pkl").exists()
+
+
+def test_releases_training_data_before_fitting_next_dependency(sdk, tmp_path):
+    """Cleanup must happen between base fits, while an ensemble is still being built."""
+    first = BaseModel("TFT_small")
+    second = BaseModel("TFT_large")
+    ensemble = Ensemble("WeightedEnsemble", {first.name: 0.5, second.name: 0.5})
+    plan = TimeSeriesRefitPlan(selection(first, second, ensemble), [ensemble.name], 600)
+    construct = sdk.cls.side_effect
+
+    def check_previous_fit(**kwargs):
+        assert not list((tmp_path / "cache").rglob("train.pkl"))
+        return construct(**kwargs)
+
+    sdk.cls.side_effect = check_previous_fit
+    plan.fit_base_models(ensemble.name, object(), tmp_path / "cache", {})
+    assert len(sdk.created) == 2
+    assert not list((tmp_path / "cache").rglob("train.pkl"))
+
+
+def test_missing_training_pickle_does_not_fail_refit(sdk, tmp_path):
+    """Tolerate AutoGluon fits that do not leave a training-data pickle."""
+    base = BaseModel("TFT")
+    plan = TimeSeriesRefitPlan(selection(base), [base.name], 600)
+    construct = sdk.cls.side_effect
+
+    def remove_training_pickle(**kwargs):
+        refit = construct(**kwargs)
+        (Path(refit.path) / "utils" / "data" / "train.pkl").unlink()
+        return refit
+
+    sdk.cls.side_effect = remove_training_pickle
+    plan.fit_base_models(base.name, object(), tmp_path / "cache", {})
+    assert list(plan.fitted) == [base.name]
+    assert plan.refit_records[0]["status"] == "completed"
 
 
 def test_nested_ensembles_share_dependencies_and_export_in_order(sdk, tmp_path):

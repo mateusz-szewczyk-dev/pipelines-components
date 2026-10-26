@@ -91,15 +91,21 @@ class TimeSeriesRefitPlan:
             started = time.perf_counter()
             record = {"model": base_name, "status": "failed"}
             try:
-                refit.fit(
-                    train_data=train_data,
-                    hyperparameters={type(base_model): hyperparameters},
-                    time_limit=self.time_limit_per_model,
-                    enable_ensemble=False,
-                    # Exactly one fixed configuration: use all rows without reserving
-                    # another validation horizon or fitting backtest windows.
-                    skip_model_selection=True,
-                )
+                try:
+                    refit.fit(
+                        train_data=train_data,
+                        hyperparameters={type(base_model): hyperparameters},
+                        time_limit=self.time_limit_per_model,
+                        enable_ensemble=False,
+                        # Exactly one fixed configuration: use all rows without reserving
+                        # another validation horizon or fitting backtest windows.
+                        skip_model_selection=True,
+                    )
+                finally:
+                    # AutoGluon persists the full refit frame. Release it before
+                    # caching or exporting predictors, also when fitting fails.
+                    # Evaluation, backtesting and inference receive data in memory.
+                    (model_path / "utils" / "data" / "train.pkl").unlink(missing_ok=True)
                 if refit.model_names() != [base_name]:
                     raise RuntimeError(f"Unexpected refit model set for {base_name!r}: {refit.model_names()}")
                 self.fitted[base_name] = refit
