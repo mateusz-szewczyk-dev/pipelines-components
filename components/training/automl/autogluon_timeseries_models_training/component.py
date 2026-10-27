@@ -37,6 +37,7 @@ def autogluon_timeseries_models_training(
     train_data_secret_name: str = "",
     train_data_bucket_name: str = "",
     train_data_file_key: str = "",
+    freq: str = "",
 ) -> NamedTuple(
     "outputs",
     top_models=List[str],
@@ -61,6 +62,8 @@ def autogluon_timeseries_models_training(
         target: Name of the target column to forecast.
         id_column: Name of the column identifying each time series (item_id).
         timestamp_column: Name of the timestamp/datetime column.
+        freq: Optional pandas frequency (e.g. "D"). Empty tries AutoGluon inference,
+            then a shared grid inferred from gaps. Ambiguous data requires explicit freq.
         train_data_path: Path to the selection training Parquet file.
         test_data: Test dataset artifact for evaluation.
         top_n: Number of top models to select for full refit.
@@ -226,8 +229,26 @@ def autogluon_timeseries_models_training(
         # Create predictor path in workspace
         predictor_path = Path(workspace_path) / "timeseries_predictor"
 
+        status.record("model_selection", "started")
+        effective_freq = freq or None
+        if effective_freq is None:
+            try:
+                effective_freq = train_ts.infer_frequency(num_items=None, raise_if_irregular=True)
+            except ValueError:
+                from kfp_components.components.training.automl.shared.timeseries_frequency import (
+                    infer_frequency_from_gaps,
+                )
+
+                effective_freq = infer_frequency_from_gaps(train_ts)
+                logger.warning(
+                    "Strict frequency inference failed; inferred freq=%r from timestamp gaps. "
+                    "AutoGluon will resample to this grid. Set freq explicitly to override this heuristic.",
+                    effective_freq,
+                )
+
         # Create TimeSeriesPredictor
         predictor = TimeSeriesPredictor(
+            freq=effective_freq,
             prediction_length=prediction_length,
             target=target,
             eval_metric=eval_metric,
@@ -242,7 +263,6 @@ def autogluon_timeseries_models_training(
             time_limit,
             prediction_length,
         )
-        status.record("model_selection", "started")
         # Accumulates only the model-fitting call durations (selection fit + refit loop) for the
         # parent metric, excluding leaderboard, evaluation, notebook and logging overhead.
         total_fit_time_seconds = 0.0
@@ -471,6 +491,7 @@ def autogluon_timeseries_models_training(
                         train_data=full_train_ts_df,
                         path=Path(workspace_path) / "timeseries_refit",
                         predictor_kwargs={
+                            "freq": effective_freq,
                             "prediction_length": prediction_length,
                             "target": target,
                             "eval_metric": eval_metric,
@@ -739,6 +760,7 @@ def autogluon_timeseries_models_training(
                     top_n=top_n,
                     eval_metric=eval_metric,
                     preset=preset,
+                    freq=freq,
                 )
                 write_experiment_notebook(
                     output_dir=Path(experiment_notebook.path),

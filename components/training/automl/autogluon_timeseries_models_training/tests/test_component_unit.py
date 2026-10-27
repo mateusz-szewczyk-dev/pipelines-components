@@ -16,12 +16,13 @@ from ..component import autogluon_timeseries_models_training
 def isolated_sys_modules():
     """Mock component dependencies while keeping notebook helpers on real pandas."""
     import pandas as pd
-    from kfp_components.components.training.automl.shared import timeseries_notebook_utils
+    from kfp_components.components.training.automl.shared import timeseries_frequency, timeseries_notebook_utils
 
     # A cached helper retains its own pandas reference. Exercise it with real
     # pandas even when this suite runs before the loader or shared tests.
     with (
         mock.patch.object(timeseries_notebook_utils, "pd", pd),
+        mock.patch.object(timeseries_frequency, "pd", pd),
         mock.patch.dict(sys.modules, clear=False) as mocked_modules,
     ):
         mocked_modules["pandas"] = mock.MagicMock()
@@ -136,6 +137,7 @@ def _mock_ts_df():
     ts_df = mock.MagicMock()
     ts_df.num_items = 3
     ts_df.__len__.return_value = 30
+    ts_df.infer_frequency.return_value = "D"
     return ts_df
 
 
@@ -177,13 +179,22 @@ class TestTimeseriesModelsTrainingUnitTests:
     @mock.patch("pandas.concat")
     @mock.patch("autogluon.timeseries.TimeSeriesDataFrame")
     @mock.patch("autogluon.timeseries.TimeSeriesPredictor")
+    @mock.patch(
+        "kfp_components.components.training.automl.shared.timeseries_frequency.infer_frequency_from_gaps",
+        return_value="15min",
+    )
+    @pytest.mark.parametrize(("freq", "inferred_freq"), [("", "h"), ("", None), ("D", None), ("h", None)])
     def test_basic_flow_returns_expected_outputs(
         self,
+        mock_gap_inference,
         mock_predictor_cls,
         mock_ts_df_cls,
         mock_concat,
         mock_read_parquet,
         mock_artifacts,  # noqa: F811
+        freq,
+        inferred_freq,
+        caplog,
     ):
         """Happy path returns top models, config, and predictor path with full refit."""
         models_artifact, extra_train_path, html_artifact, experiment_notebook = mock_artifacts
@@ -207,6 +218,10 @@ class TestTimeseriesModelsTrainingUnitTests:
         full_train_ts = _mock_ts_df()
         # from_data_frame is called for: train, test, and once per model for build_predict_sample_artifact
         mock_ts_df_cls.from_data_frame.return_value = _mock_ts_df()
+        if inferred_freq is None:
+            mock_ts_df_cls.from_data_frame.return_value.infer_frequency.side_effect = ValueError("Irregular timestamps")
+        else:
+            mock_ts_df_cls.from_data_frame.return_value.infer_frequency.return_value = inferred_freq
         mock_ts_df_cls.from_path.return_value = extra_ts
         mock_ts_df_cls.return_value = full_train_ts
         mock_concat.return_value = mock.MagicMock()
@@ -233,6 +248,7 @@ class TestTimeseriesModelsTrainingUnitTests:
             models_artifact=models_artifact,
             extra_train_data_path=extra_train_path,
             prediction_length=24,
+            freq=freq,
             html_artifact=html_artifact,
             experiment_notebook=experiment_notebook,
             component_status=_DEFAULT_COMPONENT_STATUS,
@@ -256,6 +272,20 @@ class TestTimeseriesModelsTrainingUnitTests:
         assert result.eval_metric == "mean_absolute_scaled_error"
         assert result.predictor_path == "/tmp/workspace/timeseries_predictor"
         assert result.model_config["prediction_length"] == 24
+        assert all(
+            call.kwargs["freq"] == (freq or inferred_freq or "15min") for call in mock_predictor_cls.call_args_list
+        )
+        if freq:
+            mock_ts_df_cls.from_data_frame.return_value.infer_frequency.assert_not_called()
+        else:
+            mock_ts_df_cls.from_data_frame.return_value.infer_frequency.assert_called_once_with(
+                num_items=None, raise_if_irregular=True
+            )
+        if not freq and inferred_freq is None:
+            mock_gap_inference.assert_called_once_with(mock_ts_df_cls.from_data_frame.return_value)
+            assert "inferred freq='15min' from timestamp gaps" in caplog.text
+        else:
+            mock_gap_inference.assert_not_called()
         assert result.model_config["presets"] == "speed"
         assert result.model_config["time_limit"] == 600
         assert mock_predictor.fit.call_args.kwargs["presets"] == "medium_quality"
