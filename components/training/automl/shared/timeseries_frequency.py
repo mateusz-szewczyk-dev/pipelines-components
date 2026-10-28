@@ -84,7 +84,18 @@ def validate_frequency_grid(data: pd.DataFrame, freq: str, name: str = "data", m
     ]
     offset = pd.tseries.frequencies.to_offset(freq)
     # AutoGluon skips resampling when the whole panel already matches, even at noon.
-    if all(len(timestamps) >= 3 and pd.infer_freq(timestamps) == offset.freqstr for timestamps in indexes):
+    # Short series also need compatible index metadata for AutoGluon to skip resampling.
+    candidate_freq = data.index.levels[data.index.names.index("timestamp")].freq
+    if all(
+        pd.infer_freq(timestamps) == offset.freqstr
+        if len(timestamps) >= 3
+        else (
+            candidate_freq == offset
+            and not timestamps.hasnans
+            and timestamps.equals(pd.date_range(timestamps[0], periods=len(timestamps), freq=offset))
+        )
+        for timestamps in indexes
+    ):
         return
     for timestamps in indexes:
         if timestamps.hasnans or timestamps.has_duplicates:

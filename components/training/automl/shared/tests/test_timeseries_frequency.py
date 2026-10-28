@@ -95,6 +95,47 @@ def test_regular_non_midnight_panels_keep_existing_behavior(start, freq):
     validate_frequency_grid(panel(pd.date_range(start, periods=12, freq=freq)), freq)
 
 
+@pytest.mark.parametrize(("start", "freq"), [("2020-01-01 12:00", "D"), ("2020-01-01 00:15", "h")])
+@pytest.mark.parametrize("length", [1, 2])
+def test_short_regular_series_use_shared_grid_with_index_metadata(start, freq, length):
+    """Short items can avoid resampling when AutoGluon can use index metadata."""
+    dates = pd.date_range(start, periods=12, freq=freq)
+    data = panel(dates, dates[:length])
+    assert data.index.levels[1].freq == pd.tseries.frequencies.to_offset(freq)
+    original = data.copy(deep=True)
+    validate_frequency_grid(data, freq)
+    pd.testing.assert_frame_equal(data, original)
+
+
+@pytest.mark.parametrize("positions", [[0], [0, 1], [0, 2]])
+@pytest.mark.parametrize("freq", ["D", "h", "MS"])
+def test_short_aligned_series_allow_safe_resampling(positions, freq):
+    """Short items on the resampling grid remain valid even without metadata."""
+    dates = pd.date_range("2020-01-01", periods=12, freq=freq)
+    data = panel(dates, dates[positions])
+    data.index = data.index.set_levels(pd.DatetimeIndex(data.index.levels[1].values), level="timestamp")
+    validate_frequency_grid(data, freq)
+
+
+@pytest.mark.parametrize("positions", [[0], [0, 1], [0, 2]])
+def test_short_non_midnight_series_without_metadata_require_resampling(positions):
+    """Without metadata, AutoGluon resamples even short items on a daily noon grid."""
+    dates = pd.date_range("2020-01-01 12:00", periods=12, freq="D")
+    data = panel(dates, dates[positions])
+    data.index = data.index.set_levels(pd.DatetimeIndex(data.index.levels[1].values), level="timestamp")
+    assert data.index.levels[1].freq is None
+    with pytest.raises(ValueError, match="incompatible"):
+        validate_frequency_grid(data, "D")
+
+
+@pytest.mark.parametrize("short_dates", [["2020-01-01 12:00", "2020-01-03 12:00"], ["2020-01-01 13:00"]])
+def test_short_incompatible_series_do_not_bypass_alignment(short_dates):
+    """Neither gaps nor shifted timestamps in short items can bypass validation."""
+    dates = pd.date_range("2020-01-01 12:00", periods=12, freq="D")
+    with pytest.raises(ValueError, match="incompatible"):
+        validate_frequency_grid(panel(dates, pd.to_datetime(short_dates)), "D")
+
+
 def test_one_irregular_item_causes_all_items_to_be_validated_for_resampling():
     """AutoGluon resamples the whole panel when even one item is irregular."""
     regular_noon = pd.date_range("2020-01-01 12:00", periods=12, freq="D")
