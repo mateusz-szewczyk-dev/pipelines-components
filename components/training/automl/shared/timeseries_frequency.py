@@ -73,3 +73,39 @@ def infer_frequency_from_gaps(data: pd.DataFrame, max_expansion: int = 10) -> st
         if not timestamps.isin(grid).all():
             raise ValueError(error)
     return freq
+
+
+def validate_frequency_grid(data: pd.DataFrame, freq: str, name: str = "data", max_expansion: int = 10) -> None:
+    """Validate automatic resampling; explicit user frequencies bypass this check."""
+    error = f"{name} has timestamps incompatible with automatic frequency {freq!r}. Set freq explicitly."
+    indexes = [
+        pd.DatetimeIndex(series.index.get_level_values("timestamp")).as_unit("ns").sort_values()
+        for _, series in data.groupby(level="item_id", sort=False)
+    ]
+    offset = pd.tseries.frequencies.to_offset(freq)
+    # AutoGluon skips resampling when the whole panel already matches, even at noon.
+    if all(len(timestamps) >= 3 and pd.infer_freq(timestamps) == offset.freqstr for timestamps in indexes):
+        return
+    for timestamps in indexes:
+        if timestamps.hasnans or timestamps.has_duplicates:
+            raise ValueError(error)
+        first, last = timestamps[0], timestamps[-1]
+        limit = max_expansion * len(timestamps)
+        if isinstance(offset, pd.offsets.Tick):
+            if (first.value - first.normalize().value) % offset.nanos:
+                raise ValueError(error)
+            too_large = (int(last.value) - int(first.value)) // offset.nanos + 1 > limit
+        else:
+            if offset.rollforward(first.normalize()) != first:
+                raise ValueError(error)
+            try:
+                too_large = last > first + offset * (limit - 1)
+            except (OverflowError, pd.errors.OutOfBoundsDatetime):
+                # The upper bound lies beyond representable dates.
+                too_large = False
+        if too_large:
+            raise ValueError(
+                f"Automatic frequency {freq!r} would expand a series by more than {max_expansion}x in {name}."
+            )
+        if not timestamps.isin(pd.date_range(first, last, freq=offset)).all():
+            raise ValueError(error)

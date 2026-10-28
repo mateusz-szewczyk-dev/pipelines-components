@@ -63,7 +63,8 @@ def autogluon_timeseries_models_training(
         id_column: Name of the column identifying each time series (item_id).
         timestamp_column: Name of the timestamp/datetime column.
         freq: Optional pandas frequency (e.g. "D"). Empty tries AutoGluon inference,
-            then a shared grid inferred from gaps. Ambiguous data requires explicit freq.
+            then a shared grid inferred from gaps in selection + extra training data.
+            Automatic frequency validates selection/test grids; explicit freq permits resampling.
         train_data_path: Path to the selection training Parquet file.
         test_data: Test dataset artifact for evaluation.
         top_n: Number of top models to select for full refit.
@@ -123,6 +124,10 @@ def autogluon_timeseries_models_training(
     from kfp_components.components.training.automl.shared.back_testing import build_back_testing_json
     from kfp_components.components.training.automl.shared.back_testing_charts import (
         notebook_backtest_charts_source,
+    )
+    from kfp_components.components.training.automl.shared.timeseries_frequency import (
+        infer_frequency_from_gaps,
+        validate_frequency_grid,
     )
     from kfp_components.components.training.automl.shared.timeseries_notebook_utils import (
         build_predict_sample_artifact,
@@ -195,6 +200,15 @@ def autogluon_timeseries_models_training(
             raise TypeError("split_config must be a dictionary or None.")
         sampling_config = sampling_config or {}
         split_config = split_config or {}
+        if not isinstance(freq, str):
+            raise ValueError("freq must be a string.")
+        effective_freq = freq.strip() or None
+        if effective_freq is not None:
+            try:
+                if pd.tseries.frequencies.to_offset(effective_freq).n <= 0:
+                    raise ValueError("Frequency must be positive.")
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(f"freq {freq!r} is not a valid positive pandas frequency.") from exc
         time_limit = PRESET_TIME_LIMITS[preset]
 
         train_df = pd.read_parquet(train_data_path)
@@ -226,25 +240,30 @@ def autogluon_timeseries_models_training(
             test_ts.num_items,
         )
 
+        extra_train_ts_df = TimeSeriesDataFrame.from_path(
+            path=extra_train_data_path,
+            id_column=id_column,
+            timestamp_column=timestamp_column,
+        )
+        full_train_ts_df = TimeSeriesDataFrame(pd.concat([train_ts, extra_train_ts_df], axis=0))
+        del extra_train_ts_df, train_df, test_df
+
         # Create predictor path in workspace
         predictor_path = Path(workspace_path) / "timeseries_predictor"
 
         status.record("model_selection", "started")
-        effective_freq = freq or None
         if effective_freq is None:
             try:
-                effective_freq = train_ts.infer_frequency(num_items=None, raise_if_irregular=True)
+                effective_freq = full_train_ts_df.infer_frequency(num_items=None, raise_if_irregular=True)
             except ValueError:
-                from kfp_components.components.training.automl.shared.timeseries_frequency import (
-                    infer_frequency_from_gaps,
-                )
-
-                effective_freq = infer_frequency_from_gaps(train_ts)
+                effective_freq = infer_frequency_from_gaps(full_train_ts_df)
                 logger.warning(
                     "Strict frequency inference failed; inferred freq=%r from timestamp gaps. "
                     "AutoGluon will resample to this grid. Set freq explicitly to override this heuristic.",
                     effective_freq,
                 )
+            validate_frequency_grid(train_ts, effective_freq, name="selection training data")
+            validate_frequency_grid(test_ts, effective_freq, name="test data")
 
         # Create TimeSeriesPredictor
         predictor = TimeSeriesPredictor(
@@ -328,15 +347,6 @@ def autogluon_timeseries_models_training(
             "known_covariates_names": known_covariates_names or [],
             "num_models_trained": len(leaderboard),
         }
-
-        # Stage 2: Full refit of selected models on full train data (selection + extra).
-        selection_ts_df = train_ts
-        extra_train_ts_df = TimeSeriesDataFrame.from_path(
-            path=extra_train_data_path,
-            id_column=id_column,
-            timestamp_column=timestamp_column,
-        )
-        full_train_ts_df = TimeSeriesDataFrame(pd.concat([selection_ts_df, extra_train_ts_df], axis=0))
 
         sample_row_list = json.loads(sample_rows or "[]")
         if not isinstance(sample_row_list, list):
